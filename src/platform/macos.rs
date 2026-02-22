@@ -31,7 +31,11 @@ fn sysctl_string(name: &str) -> Result<String, Box<dyn StdError>> {
         )
     };
     if ret != 0 {
-        return Err(format!("sysctlbyname size query failed for '{}': errno {}", name, ret).into());
+        return Err(format!(
+            "sysctlbyname size query failed for '{}': errno {}",
+            name, ret
+        )
+        .into());
     }
     if size == 0 {
         return Err(format!("sysctlbyname returned zero size for '{}'", name).into());
@@ -77,7 +81,11 @@ fn sysctl_u64(name: &str) -> Result<u64, Box<dyn StdError>> {
         )
     };
     if ret != 0 {
-        return Err(format!("sysctlbyname size query failed for '{}': errno {}", name, ret).into());
+        return Err(format!(
+            "sysctlbyname size query failed for '{}': errno {}",
+            name, ret
+        )
+        .into());
     }
 
     match size {
@@ -94,7 +102,9 @@ fn sysctl_u64(name: &str) -> Result<u64, Box<dyn StdError>> {
                 )
             };
             if ret != 0 {
-                return Err(format!("sysctlbyname read failed for '{}': errno {}", name, ret).into());
+                return Err(
+                    format!("sysctlbyname read failed for '{}': errno {}", name, ret).into(),
+                );
             }
             Ok(val as u64)
         }
@@ -111,7 +121,9 @@ fn sysctl_u64(name: &str) -> Result<u64, Box<dyn StdError>> {
                 )
             };
             if ret != 0 {
-                return Err(format!("sysctlbyname read failed for '{}': errno {}", name, ret).into());
+                return Err(
+                    format!("sysctlbyname read failed for '{}': errno {}", name, ret).into(),
+                );
             }
             Ok(val)
         }
@@ -173,11 +185,7 @@ mod cpu_usage_impl {
             out_processor_info: *mut *mut i32,
             out_processor_info_cnt: *mut u32,
         ) -> i32;
-        fn vm_deallocate(
-            target_task: u32,
-            address: usize,
-            size: usize,
-        ) -> i32;
+        fn vm_deallocate(target_task: u32, address: usize, size: usize) -> i32;
         fn mach_task_self() -> u32;
     }
 
@@ -403,19 +411,17 @@ impl SystemInfoProvider for MacOSSystemInfo {
     #[cfg(feature = "os")]
     fn os_info(&self) -> Result<OsInfo, Box<dyn StdError>> {
         // OS version (e.g., "14.2.1")
-        let version = sysctl_string("kern.osproductversion")
-            .unwrap_or_else(|_| "unknown".to_string());
+        let version =
+            sysctl_string("kern.osproductversion").unwrap_or_else(|_| "unknown".to_string());
 
         // Build number (e.g., "23C71")
-        let build = sysctl_string("kern.osversion")
-            .unwrap_or_else(|_| "unknown".to_string());
+        let build = sysctl_string("kern.osversion").unwrap_or_else(|_| "unknown".to_string());
 
         // Full version string (e.g., "macOS 14.2.1 (23C71)")
         let full_version = format!("macOS {} ({})", version, build);
 
         // Hostname
-        let hostname = sysctl_string("kern.hostname")
-            .unwrap_or_else(|_| "unknown".to_string());
+        let hostname = sysctl_string("kern.hostname").unwrap_or_else(|_| "unknown".to_string());
 
         // Architecture
         let arch = std::env::consts::ARCH.to_string();
@@ -451,28 +457,25 @@ impl SystemInfoProvider for MacOSSystemInfo {
     #[cfg(feature = "cpu")]
     fn cpu_info(&self) -> Result<CpuInfo, Box<dyn StdError>> {
         // CPU model (e.g., "Apple M1 Pro" or "Intel(R) Core(TM) i9-9880H")
-        let model = sysctl_string("machdep.cpu.brand_string")
-            .unwrap_or_else(|_| "Unknown CPU".to_string());
+        let model =
+            sysctl_string("machdep.cpu.brand_string").unwrap_or_else(|_| "Unknown CPU".to_string());
 
         // CPU vendor (e.g., "GenuineIntel" or "Apple")
         // On Apple Silicon, machdep.cpu.vendor may not exist
-        let vendor = sysctl_string("machdep.cpu.vendor")
-            .unwrap_or_else(|_| {
-                // Fallback: if the model contains "Apple", use "Apple"
-                if model.contains("Apple") {
-                    "Apple".to_string()
-                } else {
-                    "Unknown".to_string()
-                }
-            });
+        let vendor = sysctl_string("machdep.cpu.vendor").unwrap_or_else(|_| {
+            // Fallback: if the model contains "Apple", use "Apple"
+            if model.contains("Apple") {
+                "Apple".to_string()
+            } else {
+                "Unknown".to_string()
+            }
+        });
 
         // Physical cores
-        let cores = sysctl_u64("hw.physicalcpu")
-            .unwrap_or(0) as u32;
+        let cores = sysctl_u64("hw.physicalcpu").unwrap_or(0) as u32;
 
         // Logical cores (threads)
-        let threads = sysctl_u64("hw.logicalcpu")
-            .unwrap_or(0) as u32;
+        let threads = sysctl_u64("hw.logicalcpu").unwrap_or(0) as u32;
 
         // Architecture
         let arch = std::env::consts::ARCH.to_string();
@@ -523,7 +526,7 @@ impl SystemInfoProvider for MacOSSystemInfo {
             if total > 0.0 {
                 let active = user_delta + system_delta + nice_delta;
                 let pct = (active / total) * 100.0;
-                usage.push(pct.max(0.0).min(100.0));
+                usage.push(pct.clamp(0.0, 100.0));
             } else {
                 usage.push(0.0);
             }
@@ -544,7 +547,8 @@ impl SystemInfoProvider for MacOSSystemInfo {
         // Available = free + inactive (pages that can be reclaimed)
         // This matches what macOS reports as "available" memory
         let free_pages = stats.free_count + stats.speculative_count;
-        let available_bytes = (free_pages + stats.inactive_count + stats.purgeable_count) * page_size;
+        let available_bytes =
+            (free_pages + stats.inactive_count + stats.purgeable_count) * page_size;
 
         // Free = just the truly free pages (free_count * page_size)
         let free_bytes = free_pages * page_size;
@@ -553,8 +557,7 @@ impl SystemInfoProvider for MacOSSystemInfo {
         let used_bytes = total_bytes.saturating_sub(available_bytes);
 
         // Swap info
-        let (swap_total_bytes, swap_used_bytes) = memory_impl::get_swap_usage()
-            .unwrap_or((0, 0));
+        let (swap_total_bytes, swap_used_bytes) = memory_impl::get_swap_usage().unwrap_or((0, 0));
 
         Ok(MemoryInfo {
             total_bytes,
@@ -584,8 +587,7 @@ impl SystemInfoProvider for MacOSSystemInfo {
 
             // Pseudo-filesystem types to skip
             let pseudo_fs = [
-                "devfs", "autofs", "nullfs", "vmhgfs", "ctfs", "fdescfs",
-                "nfs", "devpts", "tmpfs",
+                "devfs", "autofs", "nullfs", "vmhgfs", "ctfs", "fdescfs", "nfs", "devpts", "tmpfs",
             ];
 
             for entry in entries {
@@ -611,8 +613,11 @@ impl SystemInfoProvider for MacOSSystemInfo {
                     continue;
                 }
 
+                #[allow(clippy::unnecessary_cast)]
                 let block_size = entry.f_bsize as u64;
+                #[allow(clippy::unnecessary_cast)]
                 let total_bytes = entry.f_blocks as u64 * block_size;
+                #[allow(clippy::unnecessary_cast)]
                 let free_bytes = entry.f_bfree as u64 * block_size;
                 let used_bytes = total_bytes.saturating_sub(free_bytes);
 
@@ -673,23 +678,32 @@ impl SystemInfoProvider for MacOSSystemInfo {
         if let Some(displays_array) = parsed.get("SPDisplaysDataType").and_then(|v| v.as_array()) {
             for gpu_entry in displays_array {
                 // GPU name
-                let name = gpu_entry.get("sppci_model")
+                let name = gpu_entry
+                    .get("sppci_model")
                     .or_else(|| gpu_entry.get("_name"))
                     .and_then(|v| v.as_str())
                     .unwrap_or("Unknown GPU")
                     .to_string();
 
                 // Vendor
-                let vendor_raw = gpu_entry.get("sppci_vendor")
+                let vendor_raw = gpu_entry
+                    .get("sppci_vendor")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
                 let vendor = if !vendor_raw.is_empty() {
                     // system_profiler returns strings like "sppci_vendor_apple", "sppci_vendor_amd", etc.
                     if vendor_raw.contains("apple") || name.contains("Apple") {
                         "Apple".to_string()
-                    } else if vendor_raw.contains("amd") || vendor_raw.contains("ATI") || name.contains("AMD") || name.contains("Radeon") {
+                    } else if vendor_raw.contains("amd")
+                        || vendor_raw.contains("ATI")
+                        || name.contains("AMD")
+                        || name.contains("Radeon")
+                    {
                         "AMD".to_string()
-                    } else if vendor_raw.contains("nvidia") || name.contains("NVIDIA") || name.contains("GeForce") {
+                    } else if vendor_raw.contains("nvidia")
+                        || name.contains("NVIDIA")
+                        || name.contains("GeForce")
+                    {
                         "NVIDIA".to_string()
                     } else if vendor_raw.contains("intel") || name.contains("Intel") {
                         "Intel".to_string()
@@ -712,7 +726,8 @@ impl SystemInfoProvider for MacOSSystemInfo {
                 };
 
                 // VRAM in MB
-                let vram_mb = gpu_entry.get("sppci_vram")
+                let vram_mb = gpu_entry
+                    .get("sppci_vram")
                     .or_else(|| gpu_entry.get("_spdisplays_vram"))
                     .and_then(|v| v.as_str())
                     .and_then(|s| {
@@ -723,23 +738,21 @@ impl SystemInfoProvider for MacOSSystemInfo {
                             let unit = parts[1].to_uppercase();
                             if unit.starts_with("GB") {
                                 Some(amount * 1024)
-                            } else if unit.starts_with("MB") {
-                                Some(amount)
                             } else {
+                                // MB or any other unit, assume MB
                                 Some(amount)
                             }
-                        } else if let Ok(val) = s.parse::<u64>() {
-                            // If just a number, assume MB
-                            Some(val)
                         } else {
-                            None
+                            // If just a number, assume MB
+                            s.parse::<u64>().ok()
                         }
                     })
                     .unwrap_or(0);
 
                 // Driver version: on Apple Silicon there's no meaningful driver version,
                 // use the Metal/GPU family support or leave empty
-                let driver_version = gpu_entry.get("spdisplays_metal")
+                let driver_version = gpu_entry
+                    .get("spdisplays_metal")
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string())
                     .unwrap_or_default();
@@ -794,11 +807,20 @@ impl SystemInfoProvider for MacOSSystemInfo {
                 has_battery = true;
 
                 // Current charge level
-                if let Some(current) = charge_info.get("sppower_battery_current_capacity")
-                    .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+                if let Some(current) = charge_info
+                    .get("sppower_battery_current_capacity")
+                    .and_then(|v| {
+                        v.as_u64()
+                            .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+                    })
                 {
-                    if let Some(max) = charge_info.get("sppower_battery_max_capacity")
-                        .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+                    if let Some(max) =
+                        charge_info
+                            .get("sppower_battery_max_capacity")
+                            .and_then(|v| {
+                                v.as_u64()
+                                    .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+                            })
                     {
                         max_capacity = Some(max);
                         if max > 0 {
@@ -809,8 +831,8 @@ impl SystemInfoProvider for MacOSSystemInfo {
 
                 // Charging state
                 if let Some(charging) = charge_info.get("sppower_battery_is_charging") {
-                    is_charging = charging.as_str() == Some("TRUE")
-                        || charging.as_bool() == Some(true);
+                    is_charging =
+                        charging.as_str() == Some("TRUE") || charging.as_bool() == Some(true);
                 }
             }
 
@@ -819,16 +841,22 @@ impl SystemInfoProvider for MacOSSystemInfo {
                 has_battery = true;
 
                 // Cycle count
-                if let Some(cycles) = health_info.get("sppower_battery_cycle_count")
-                    .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+                if let Some(cycles) = health_info
+                    .get("sppower_battery_cycle_count")
+                    .and_then(|v| {
+                        v.as_u64()
+                            .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+                    })
                 {
                     cycle_count = Some(cycles as u32);
                 }
 
                 // Maximum capacity percent (battery health)
-                if let Some(max_pct) = health_info.get("sppower_battery_health_maximum_capacity")
+                if let Some(max_pct) = health_info
+                    .get("sppower_battery_health_maximum_capacity")
                     .and_then(|v| {
-                        v.as_str().and_then(|s| s.trim_end_matches('%').parse::<f64>().ok())
+                        v.as_str()
+                            .and_then(|s| s.trim_end_matches('%').parse::<f64>().ok())
                             .or_else(|| v.as_f64())
                             .or_else(|| v.as_u64().map(|n| n as f64))
                     })
@@ -840,8 +868,8 @@ impl SystemInfoProvider for MacOSSystemInfo {
             // Check for AC charger info (connected state)
             if let Some(ac_info) = entry.get("sppower_ac_charger_information") {
                 if let Some(connected) = ac_info.get("sppower_battery_charger_connected") {
-                    is_connected = connected.as_str() == Some("TRUE")
-                        || connected.as_bool() == Some(true);
+                    is_connected =
+                        connected.as_str() == Some("TRUE") || connected.as_bool() == Some(true);
                 }
             }
 
@@ -852,8 +880,12 @@ impl SystemInfoProvider for MacOSSystemInfo {
 
             // Try to get design capacity from battery model info
             if let Some(model_info) = entry.get("sppower_battery_model_info") {
-                if let Some(dc) = model_info.get("sppower_battery_design_capacity")
-                    .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+                if let Some(dc) = model_info
+                    .get("sppower_battery_design_capacity")
+                    .and_then(|v| {
+                        v.as_u64()
+                            .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+                    })
                 {
                     design_capacity = Some(dc);
                 }
@@ -914,15 +946,19 @@ impl SystemInfoProvider for MacOSSystemInfo {
                     .to_string_lossy()
                     .to_string();
 
-                let entry = iface_map.entry(name.clone()).or_insert_with(|| NetworkInfo {
-                    name: name.clone(),
-                    mac_address: String::new(),
-                    ipv4: Vec::new(),
-                    ipv6: Vec::new(),
-                    rx_bytes: 0,
-                    tx_bytes: 0,
-                    is_up: (ifa.ifa_flags as u32 & libc::IFF_UP as u32) != 0,
-                });
+                #[allow(clippy::unnecessary_cast)]
+                let iface_is_up = (ifa.ifa_flags & libc::IFF_UP as u32) != 0;
+                let entry = iface_map
+                    .entry(name.clone())
+                    .or_insert_with(|| NetworkInfo {
+                        name: name.clone(),
+                        mac_address: String::new(),
+                        ipv4: Vec::new(),
+                        ipv6: Vec::new(),
+                        rx_bytes: 0,
+                        tx_bytes: 0,
+                        is_up: iface_is_up,
+                    });
 
                 if !ifa.ifa_addr.is_null() {
                     let sa_family = (*ifa.ifa_addr).sa_family;
@@ -1052,9 +1088,12 @@ impl SystemInfoProvider for MacOSSystemInfo {
         if let Some(gpu_array) = parsed.get("SPDisplaysDataType").and_then(|v| v.as_array()) {
             for gpu_entry in gpu_array {
                 // Each GPU entry may have a "spdisplays_ndrvs" array of connected displays
-                if let Some(display_array) = gpu_entry.get("spdisplays_ndrvs").and_then(|v| v.as_array()) {
+                if let Some(display_array) =
+                    gpu_entry.get("spdisplays_ndrvs").and_then(|v| v.as_array())
+                {
                     for display_entry in display_array {
-                        let name = display_entry.get("_name")
+                        let name = display_entry
+                            .get("_name")
                             .and_then(|v| v.as_str())
                             .unwrap_or("Unknown Display")
                             .to_string();
@@ -1064,20 +1103,22 @@ impl SystemInfoProvider for MacOSSystemInfo {
                         let (width, height, refresh_rate_hz) = display_entry
                             .get("_spdisplays_resolution")
                             .and_then(|v| v.as_str())
-                            .map(|s| parse_macos_resolution(s))
+                            .map(parse_macos_resolution)
                             .unwrap_or((0, 0, None));
 
                         // DPI: try to get from pixel resolution and physical size
                         // system_profiler provides "_spdisplays_resolution" but not always physical size
                         // Use Retina flag to estimate DPI
-                        let is_retina = display_entry.get("spdisplays_retina")
+                        let is_retina = display_entry
+                            .get("spdisplays_retina")
                             .and_then(|v| v.as_str())
                             .map(|s| s.contains("spdisplays_yes"))
                             .unwrap_or(false);
                         let dpi = if is_retina { 144.0 } else { 72.0 };
 
                         // Primary: the main display is typically the first one listed
-                        let is_main = display_entry.get("spdisplays_main")
+                        let is_main = display_entry
+                            .get("spdisplays_main")
                             .and_then(|v| v.as_str())
                             .map(|s| s.contains("spdisplays_yes"))
                             .unwrap_or(false);

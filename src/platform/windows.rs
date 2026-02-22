@@ -3,13 +3,11 @@ use crate::platform::SystemInfoProvider;
 use std::error::Error as StdError;
 
 #[cfg(any(feature = "os", feature = "cpu"))]
-use windows::Win32::System::SystemInformation::{
-    GetNativeSystemInfo, SYSTEM_INFO,
-};
+use windows::Win32::System::SystemInformation::{GetNativeSystemInfo, SYSTEM_INFO};
 
 #[cfg(feature = "os")]
 use windows::Win32::System::SystemInformation::{
-    GetComputerNameExW, GetTickCount64, ComputerNameDnsHostname,
+    ComputerNameDnsHostname, GetComputerNameExW, GetTickCount64,
 };
 
 #[cfg(feature = "os")]
@@ -23,13 +21,14 @@ use windows::core::PWSTR;
 
 #[cfg(feature = "cpu")]
 use windows::Win32::System::SystemInformation::{
-    GetLogicalProcessorInformationEx, RelationProcessorCore, SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
+    GetLogicalProcessorInformationEx, RelationProcessorCore,
+    SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
 };
 
 #[cfg(feature = "cpu")]
 use windows::Win32::System::Registry::{
-    RegOpenKeyExW, RegQueryValueExW, RegCloseKey, HKEY, HKEY_LOCAL_MACHINE,
-    KEY_READ, REG_VALUE_TYPE,
+    RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_LOCAL_MACHINE, KEY_READ,
+    REG_VALUE_TYPE,
 };
 
 #[cfg(feature = "cpu")]
@@ -45,8 +44,7 @@ use windows::Win32::Storage::FileSystem::{
 
 #[cfg(feature = "network")]
 use windows::Win32::NetworkManagement::IpHelper::{
-    GetAdaptersAddresses, GetIfEntry2, GAA_FLAG_INCLUDE_PREFIX,
-    MIB_IF_ROW2,
+    GetAdaptersAddresses, GetIfEntry2, GAA_FLAG_INCLUDE_PREFIX, MIB_IF_ROW2,
 };
 
 #[cfg(feature = "network")]
@@ -82,10 +80,10 @@ fn get_arch_string(sys_info: &SYSTEM_INFO) -> String {
     let arch = unsafe { sys_info.Anonymous.Anonymous.wProcessorArchitecture };
     match arch.0 {
         9 => "x86_64".to_string(),   // PROCESSOR_ARCHITECTURE_AMD64
-        12 => "aarch64".to_string(),  // PROCESSOR_ARCHITECTURE_ARM64
-        5 => "arm".to_string(),       // PROCESSOR_ARCHITECTURE_ARM
-        0 => "x86".to_string(),       // PROCESSOR_ARCHITECTURE_INTEL
-        6 => "ia64".to_string(),      // PROCESSOR_ARCHITECTURE_IA64
+        12 => "aarch64".to_string(), // PROCESSOR_ARCHITECTURE_ARM64
+        5 => "arm".to_string(),      // PROCESSOR_ARCHITECTURE_ARM
+        0 => "x86".to_string(),      // PROCESSOR_ARCHITECTURE_INTEL
+        6 => "ia64".to_string(),     // PROCESSOR_ARCHITECTURE_IA64
         _ => "unknown".to_string(),
     }
 }
@@ -94,7 +92,10 @@ fn get_arch_string(sys_info: &SYSTEM_INFO) -> String {
 fn read_registry_string(subkey: &str, value_name: &str) -> Result<String, Box<dyn StdError>> {
     unsafe {
         let subkey_wide: Vec<u16> = subkey.encode_utf16().chain(std::iter::once(0)).collect();
-        let value_wide: Vec<u16> = value_name.encode_utf16().chain(std::iter::once(0)).collect();
+        let value_wide: Vec<u16> = value_name
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
 
         let mut hkey = HKEY::default();
         let result = RegOpenKeyExW(
@@ -144,12 +145,13 @@ fn read_registry_string(subkey: &str, value_name: &str) -> Result<String, Box<dy
         }
 
         // Convert wide string to Rust String
-        let wide_slice = std::slice::from_raw_parts(
-            buffer.as_ptr() as *const u16,
-            data_size as usize / 2,
-        );
+        let wide_slice =
+            std::slice::from_raw_parts(buffer.as_ptr() as *const u16, data_size as usize / 2);
         // Trim null terminator
-        let len = wide_slice.iter().position(|&c| c == 0).unwrap_or(wide_slice.len());
+        let len = wide_slice
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(wide_slice.len());
         Ok(String::from_utf16_lossy(&wide_slice[..len]))
     }
 }
@@ -158,7 +160,10 @@ fn read_registry_string(subkey: &str, value_name: &str) -> Result<String, Box<dy
 fn read_registry_dword(subkey: &str, value_name: &str) -> Result<u32, Box<dyn StdError>> {
     unsafe {
         let subkey_wide: Vec<u16> = subkey.encode_utf16().chain(std::iter::once(0)).collect();
-        let value_wide: Vec<u16> = value_name.encode_utf16().chain(std::iter::once(0)).collect();
+        let value_wide: Vec<u16> = value_name
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
 
         let mut hkey = HKEY::default();
         let result = RegOpenKeyExW(
@@ -200,11 +205,7 @@ fn get_physical_core_count() -> Result<u32, Box<dyn StdError>> {
     unsafe {
         // First call to get required buffer size
         let mut length: u32 = 0;
-        let _ = GetLogicalProcessorInformationEx(
-            RelationProcessorCore,
-            None,
-            &mut length,
-        );
+        let _ = GetLogicalProcessorInformationEx(RelationProcessorCore, None, &mut length);
 
         if length == 0 {
             return Err("GetLogicalProcessorInformationEx returned zero length".into());
@@ -222,7 +223,8 @@ fn get_physical_core_count() -> Result<u32, Box<dyn StdError>> {
         let mut core_count: u32 = 0;
         let mut offset: usize = 0;
         while offset < length as usize {
-            let info = &*(buffer.as_ptr().add(offset) as *const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX);
+            let info =
+                &*(buffer.as_ptr().add(offset) as *const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX);
             core_count += 1;
             offset += info.Size as usize;
         }
@@ -251,15 +253,18 @@ fn get_display_dpi() -> f64 {
 
 #[cfg(feature = "gpu")]
 fn read_registry_string_gpu(subkey: &str, value_name: &str) -> Result<String, Box<dyn StdError>> {
-    use windows::Win32::System::Registry::{
-        RegOpenKeyExW, RegQueryValueExW, RegCloseKey, HKEY, HKEY_LOCAL_MACHINE,
-        KEY_READ, REG_VALUE_TYPE,
-    };
     use windows::core::PCWSTR;
+    use windows::Win32::System::Registry::{
+        RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_LOCAL_MACHINE, KEY_READ,
+        REG_VALUE_TYPE,
+    };
 
     unsafe {
         let subkey_wide: Vec<u16> = subkey.encode_utf16().chain(std::iter::once(0)).collect();
-        let value_wide: Vec<u16> = value_name.encode_utf16().chain(std::iter::once(0)).collect();
+        let value_wide: Vec<u16> = value_name
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
 
         let mut hkey = HKEY::default();
         let result = RegOpenKeyExW(
@@ -306,11 +311,12 @@ fn read_registry_string_gpu(subkey: &str, value_name: &str) -> Result<String, Bo
             return Err(format!("Failed to read registry value: {}", value_name).into());
         }
 
-        let wide_slice = std::slice::from_raw_parts(
-            buffer.as_ptr() as *const u16,
-            data_size as usize / 2,
-        );
-        let len = wide_slice.iter().position(|&c| c == 0).unwrap_or(wide_slice.len());
+        let wide_slice =
+            std::slice::from_raw_parts(buffer.as_ptr() as *const u16, data_size as usize / 2);
+        let len = wide_slice
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(wide_slice.len());
         Ok(String::from_utf16_lossy(&wide_slice[..len]))
     }
 }
@@ -319,11 +325,11 @@ fn read_registry_string_gpu(subkey: &str, value_name: &str) -> Result<String, Bo
 
 #[cfg(feature = "disk")]
 fn detect_disk_kind_for_drive(drive_path: &str) -> DiskKind {
+    use windows::Win32::Foundation::CloseHandle;
     use windows::Win32::Storage::FileSystem::{
         CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
     };
     use windows::Win32::System::IO::DeviceIoControl;
-    use windows::Win32::Foundation::CloseHandle;
 
     // Extract the drive letter from a path like "C:\"
     let drive_letter = match drive_path.chars().next() {
@@ -333,7 +339,10 @@ fn detect_disk_kind_for_drive(drive_path: &str) -> DiskKind {
 
     // Open the physical drive via the volume device path
     let device_path = format!("\\\\.\\{}:", drive_letter);
-    let device_wide: Vec<u16> = device_path.encode_utf16().chain(std::iter::once(0)).collect();
+    let device_wide: Vec<u16> = device_path
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
 
     unsafe {
         let handle = CreateFileW(
@@ -416,9 +425,9 @@ type CpuTimesResult = Result<Vec<(i64, i64, i64)>, Box<dyn StdError>>;
 
 #[cfg(feature = "cpu")]
 fn query_cpu_times() -> CpuTimesResult {
-    use windows::Win32::System::WindowsProgramming::SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION;
     use windows::Wdk::System::SystemInformation::NtQuerySystemInformation;
     use windows::Wdk::System::SystemInformation::SYSTEM_INFORMATION_CLASS;
+    use windows::Win32::System::WindowsProgramming::SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION;
 
     let sys_info = get_native_system_info();
     let num_cpus = sys_info.dwNumberOfProcessors as usize;
@@ -556,8 +565,7 @@ impl SystemInfoProvider for WindowsSystemInfo {
             .to_string();
 
         // Read frequency
-        let frequency_mhz = read_registry_dword(reg_path, "~MHz")
-            .unwrap_or(0) as u64;
+        let frequency_mhz = read_registry_dword(reg_path, "~MHz").unwrap_or(0) as u64;
 
         // Get logical processor count
         let sys_info = get_native_system_info();
@@ -679,7 +687,8 @@ impl SystemInfoProvider for WindowsSystemInfo {
 
                         // Get drive type
                         let drive_type = GetDriveTypeW(drive_pcwstr);
-                        let is_removable = drive_type == DRIVE_REMOVABLE_CONST || drive_type == DRIVE_CDROM_CONST;
+                        let is_removable =
+                            drive_type == DRIVE_REMOVABLE_CONST || drive_type == DRIVE_CDROM_CONST;
 
                         // Skip DRIVE_UNKNOWN (0) or DRIVE_NO_ROOT_DIR (1)
                         if drive_type <= 1 {
@@ -704,14 +713,20 @@ impl SystemInfoProvider for WindowsSystemInfo {
                         );
 
                         let vol_name = if vol_ok.is_ok() {
-                            let len = vol_name_buf.iter().position(|&c| c == 0).unwrap_or(vol_name_buf.len());
+                            let len = vol_name_buf
+                                .iter()
+                                .position(|&c| c == 0)
+                                .unwrap_or(vol_name_buf.len());
                             String::from_utf16_lossy(&vol_name_buf[..len])
                         } else {
                             String::new()
                         };
 
                         let fs_type = if vol_ok.is_ok() {
-                            let len = fs_name_buf.iter().position(|&c| c == 0).unwrap_or(fs_name_buf.len());
+                            let len = fs_name_buf
+                                .iter()
+                                .position(|&c| c == 0)
+                                .unwrap_or(fs_name_buf.len());
                             String::from_utf16_lossy(&fs_name_buf[..len])
                         } else {
                             String::new()
@@ -796,7 +811,10 @@ impl SystemInfoProvider for WindowsSystemInfo {
                 }
 
                 // Convert wide-char description to String
-                let name_len = desc.Description.iter().position(|&c| c == 0)
+                let name_len = desc
+                    .Description
+                    .iter()
+                    .position(|&c| c == 0)
                     .unwrap_or(desc.Description.len());
                 let name = String::from_utf16_lossy(&desc.Description[..name_len]);
 
@@ -823,8 +841,12 @@ impl SystemInfoProvider for WindowsSystemInfo {
                         let subkey = format!("{}\\{:04}", reg_path, i);
                         if let Ok(desc_reg) = read_registry_string_gpu(&subkey, "DriverDesc") {
                             // Match adapter by name similarity
-                            if name.contains(&desc_reg) || desc_reg.contains(&name) || i == (adapter_index - 1) {
-                                if let Ok(ver) = read_registry_string_gpu(&subkey, "DriverVersion") {
+                            if name.contains(&desc_reg)
+                                || desc_reg.contains(&name)
+                                || i == (adapter_index - 1)
+                            {
+                                if let Ok(ver) = read_registry_string_gpu(&subkey, "DriverVersion")
+                                {
                                     found_version = ver;
                                     break;
                                 }
@@ -945,15 +967,10 @@ impl SystemInfoProvider for WindowsSystemInfo {
             }
 
             let mut buffer: Vec<u8> = vec![0u8; buf_len as usize];
-            let adapter_ptr = buffer.as_mut_ptr() as *mut windows::Win32::NetworkManagement::IpHelper::IP_ADAPTER_ADDRESSES_LH;
+            let adapter_ptr = buffer.as_mut_ptr()
+                as *mut windows::Win32::NetworkManagement::IpHelper::IP_ADAPTER_ADDRESSES_LH;
 
-            let ret = GetAdaptersAddresses(
-                family,
-                flags,
-                None,
-                Some(adapter_ptr),
-                &mut buf_len,
-            );
+            let ret = GetAdaptersAddresses(family, flags, None, Some(adapter_ptr), &mut buf_len);
 
             if ret != 0 {
                 return Err(format!("GetAdaptersAddresses failed: {}", ret).into());
@@ -971,7 +988,10 @@ impl SystemInfoProvider for WindowsSystemInfo {
                         len += 1;
                         p = p.add(1);
                     }
-                    String::from_utf16_lossy(std::slice::from_raw_parts(adapter.FriendlyName.0, len))
+                    String::from_utf16_lossy(std::slice::from_raw_parts(
+                        adapter.FriendlyName.0,
+                        len,
+                    ))
                 } else {
                     String::new()
                 };
@@ -1025,7 +1045,10 @@ impl SystemInfoProvider for WindowsSystemInfo {
                 let mut tx_bytes: u64 = 0;
                 let if_index = adapter.Anonymous1.Anonymous.IfIndex;
                 if if_index != 0 {
-                    let mut row = MIB_IF_ROW2 { InterfaceIndex: if_index, ..Default::default() };
+                    let mut row = MIB_IF_ROW2 {
+                        InterfaceIndex: if_index,
+                        ..Default::default()
+                    };
                     if GetIfEntry2(&mut row).is_ok() {
                         rx_bytes = row.InOctets;
                         tx_bytes = row.OutOctets;
@@ -1061,10 +1084,8 @@ impl SystemInfoProvider for WindowsSystemInfo {
     #[cfg(feature = "display")]
     fn display_info(&self) -> Result<Vec<DisplayInfo>, Box<dyn StdError>> {
         use windows::Win32::Graphics::Gdi::{
-            EnumDisplayDevicesW, EnumDisplaySettingsW,
-            DISPLAY_DEVICEW, DEVMODEW,
-            ENUM_CURRENT_SETTINGS, DISPLAY_DEVICE_ACTIVE,
-            DISPLAY_DEVICE_PRIMARY_DEVICE,
+            EnumDisplayDevicesW, EnumDisplaySettingsW, DEVMODEW, DISPLAY_DEVICEW,
+            DISPLAY_DEVICE_ACTIVE, DISPLAY_DEVICE_PRIMARY_DEVICE, ENUM_CURRENT_SETTINGS,
         };
 
         let mut displays = Vec::new();
@@ -1077,12 +1098,7 @@ impl SystemInfoProvider for WindowsSystemInfo {
                     ..Default::default()
                 };
 
-                let ok = EnumDisplayDevicesW(
-                    None,
-                    device_index,
-                    &mut device,
-                    0,
-                );
+                let ok = EnumDisplayDevicesW(None, device_index, &mut device, 0);
                 if !ok.as_bool() {
                     break;
                 }
@@ -1096,7 +1112,10 @@ impl SystemInfoProvider for WindowsSystemInfo {
                 let is_primary = (device.StateFlags & DISPLAY_DEVICE_PRIMARY_DEVICE) != 0;
 
                 // Get device name
-                let name_len = device.DeviceName.iter().position(|&c| c == 0)
+                let name_len = device
+                    .DeviceName
+                    .iter()
+                    .position(|&c| c == 0)
                     .unwrap_or(device.DeviceName.len());
                 let device_name_wide = &device.DeviceName[..name_len];
                 let device_name = String::from_utf16_lossy(device_name_wide);
@@ -1107,19 +1126,23 @@ impl SystemInfoProvider for WindowsSystemInfo {
                     ..Default::default()
                 };
                 let device_name_pcwstr = windows::core::PCWSTR(device.DeviceName.as_ptr());
-                let friendly_name = if EnumDisplayDevicesW(
-                    device_name_pcwstr,
-                    0,
-                    &mut monitor_device,
-                    0,
-                ).as_bool() {
-                    let len = monitor_device.DeviceString.iter().position(|&c| c == 0)
-                        .unwrap_or(monitor_device.DeviceString.len());
-                    let s = String::from_utf16_lossy(&monitor_device.DeviceString[..len]);
-                    if s.is_empty() { device_name.clone() } else { s }
-                } else {
-                    device_name.clone()
-                };
+                let friendly_name =
+                    if EnumDisplayDevicesW(device_name_pcwstr, 0, &mut monitor_device, 0).as_bool()
+                    {
+                        let len = monitor_device
+                            .DeviceString
+                            .iter()
+                            .position(|&c| c == 0)
+                            .unwrap_or(monitor_device.DeviceString.len());
+                        let s = String::from_utf16_lossy(&monitor_device.DeviceString[..len]);
+                        if s.is_empty() {
+                            device_name.clone()
+                        } else {
+                            s
+                        }
+                    } else {
+                        device_name.clone()
+                    };
 
                 // Get current display settings (resolution, refresh rate)
                 let mut devmode = DEVMODEW {
@@ -1127,11 +1150,8 @@ impl SystemInfoProvider for WindowsSystemInfo {
                     ..Default::default()
                 };
 
-                let settings_ok = EnumDisplaySettingsW(
-                    device_name_pcwstr,
-                    ENUM_CURRENT_SETTINGS,
-                    &mut devmode,
-                );
+                let settings_ok =
+                    EnumDisplaySettingsW(device_name_pcwstr, ENUM_CURRENT_SETTINGS, &mut devmode);
                 if !settings_ok.as_bool() {
                     continue;
                 }

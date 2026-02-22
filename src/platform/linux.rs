@@ -76,10 +76,7 @@ fn parse_proc_cpuinfo() -> Result<CpuInfoRaw, Box<dyn StdError>> {
                 }
                 "cpu MHz" => {
                     if frequency_mhz == 0 {
-                        frequency_mhz = value
-                            .parse::<f64>()
-                            .map(|v| v as u64)
-                            .unwrap_or(0);
+                        frequency_mhz = value.parse::<f64>().map(|v| v as u64).unwrap_or(0);
                     }
                 }
                 "processor" => {
@@ -190,10 +187,7 @@ fn parse_proc_meminfo() -> Result<std::collections::HashMap<String, u64>, Box<dy
             let key = key.trim().to_string();
             let value_str = rest.trim();
             // Strip the " kB" suffix if present, then parse the number
-            let numeric_part = value_str
-                .split_whitespace()
-                .next()
-                .unwrap_or("0");
+            let numeric_part = value_str.split_whitespace().next().unwrap_or("0");
             if let Ok(value_kb) = numeric_part.parse::<u64>() {
                 // Values in /proc/meminfo labeled "kB" are actually KiB (1024 bytes)
                 map.insert(key, value_kb * 1024);
@@ -282,13 +276,21 @@ fn parse_xrandr_displays() -> Result<Vec<crate::models::DisplayInfo>, Box<dyn st
             current_is_primary = line.contains(" primary ");
 
             // Extract monitor name (first word)
-            current_name = line.split_whitespace().next().unwrap_or("Unknown").to_string();
+            current_name = line
+                .split_whitespace()
+                .next()
+                .unwrap_or("Unknown")
+                .to_string();
 
             // Extract physical size in mm (e.g., "344mm x 193mm")
             current_width_mm = 0.0;
             let parts: Vec<&str> = line.split_whitespace().collect();
             for (i, part) in parts.iter().enumerate() {
-                if part.ends_with("mm") && i + 2 < parts.len() && parts[i + 1] == "x" && parts[i + 2].ends_with("mm") {
+                if part.ends_with("mm")
+                    && i + 2 < parts.len()
+                    && parts[i + 1] == "x"
+                    && parts[i + 2].ends_with("mm")
+                {
                     current_width_mm = part.trim_end_matches("mm").parse().unwrap_or(0.0);
                     break;
                 }
@@ -330,7 +332,7 @@ fn parse_xrandr_displays() -> Result<Vec<crate::models::DisplayInfo>, Box<dyn st
             let mut refresh_rate_hz: Option<f64> = None;
             for token in trimmed.split_whitespace().skip(1) {
                 if token.contains('*') {
-                    let rate_str = token.replace('*', "").replace('+', "");
+                    let rate_str = token.replace(['*', '+'], "");
                     if let Ok(hz) = rate_str.parse::<f64>() {
                         refresh_rate_hz = Some(hz);
                     }
@@ -389,19 +391,14 @@ impl SystemInfoProvider for LinuxSystemInfo {
                 .get("NAME")
                 .cloned()
                 .unwrap_or_else(|| "Linux".to_string());
-            let os_version = os_release
-                .get("VERSION")
-                .cloned();
+            let os_version = os_release.get("VERSION").cloned();
 
             if let Some(ver) = os_version {
                 format!("{} {}", os_name, ver)
             } else if let Ok(proc_version) = std::fs::read_to_string("/proc/version") {
                 // /proc/version contains something like "Linux version 5.15.0-generic ..."
                 // Extract the kernel version
-                let kernel_ver = proc_version
-                    .split_whitespace()
-                    .nth(2)
-                    .unwrap_or("unknown");
+                let kernel_ver = proc_version.split_whitespace().nth(2).unwrap_or("unknown");
                 format!("{} (kernel {})", os_name, kernel_ver)
             } else {
                 os_name
@@ -486,7 +483,7 @@ impl SystemInfoProvider for LinuxSystemInfo {
 
             if total_delta > 0.0 {
                 let pct = (1.0 - idle_delta / total_delta) * 100.0;
-                usage.push(pct.max(0.0).min(100.0));
+                usage.push(pct.clamp(0.0, 100.0));
             } else {
                 usage.push(0.0);
             }
@@ -527,11 +524,32 @@ impl SystemInfoProvider for LinuxSystemInfo {
 
         // Pseudo-filesystem types to skip
         let pseudo_fs = [
-            "proc", "sysfs", "devtmpfs", "tmpfs", "cgroup", "cgroup2",
-            "pstore", "debugfs", "securityfs", "configfs", "fusectl",
-            "mqueue", "hugetlbfs", "devpts", "autofs", "binfmt_misc",
-            "tracefs", "efivarfs", "bpf", "overlay", "nsfs", "ramfs",
-            "rpc_pipefs", "nfsd", "fuse.portal", "fuse.gvfsd-fuse",
+            "proc",
+            "sysfs",
+            "devtmpfs",
+            "tmpfs",
+            "cgroup",
+            "cgroup2",
+            "pstore",
+            "debugfs",
+            "securityfs",
+            "configfs",
+            "fusectl",
+            "mqueue",
+            "hugetlbfs",
+            "devpts",
+            "autofs",
+            "binfmt_misc",
+            "tracefs",
+            "efivarfs",
+            "bpf",
+            "overlay",
+            "nsfs",
+            "ramfs",
+            "rpc_pipefs",
+            "nfsd",
+            "fuse.portal",
+            "fuse.gvfsd-fuse",
         ];
 
         let mut disks = Vec::new();
@@ -564,8 +582,11 @@ impl SystemInfoProvider for LinuxSystemInfo {
                 continue;
             }
 
+            #[allow(clippy::unnecessary_cast)]
             let block_size = stat.f_frsize as u64;
+            #[allow(clippy::unnecessary_cast)]
             let total_bytes = stat.f_blocks as u64 * block_size;
+            #[allow(clippy::unnecessary_cast)]
             let free_bytes = stat.f_bfree as u64 * block_size;
             let used_bytes = total_bytes.saturating_sub(free_bytes);
 
@@ -575,10 +596,7 @@ impl SystemInfoProvider for LinuxSystemInfo {
             }
 
             // Extract base device name for sysfs lookups (e.g., /dev/sda1 -> sda)
-            let dev_name = device
-                .rsplit('/')
-                .next()
-                .unwrap_or(device);
+            let dev_name = device.rsplit('/').next().unwrap_or(device);
             // Strip partition number to get base device (sda1 -> sda, nvme0n1p1 -> nvme0n1)
             let base_device = if dev_name.starts_with("nvme") || dev_name.starts_with("mmcblk") {
                 // NVMe: nvme0n1p1 -> nvme0n1, MMC: mmcblk0p1 -> mmcblk0
@@ -664,10 +682,8 @@ impl SystemInfoProvider for LinuxSystemInfo {
                 .unwrap_or_default()
                 .trim()
                 .to_string();
-            let vendor_id = u32::from_str_radix(
-                vendor_id_str.trim_start_matches("0x"),
-                16,
-            ).unwrap_or(0);
+            let vendor_id =
+                u32::from_str_radix(vendor_id_str.trim_start_matches("0x"), 16).unwrap_or(0);
 
             let vendor = match vendor_id {
                 0x10de => "NVIDIA".to_string(),
@@ -691,7 +707,8 @@ impl SystemInfoProvider for LinuxSystemInfo {
                     label
                 } else {
                     // Fall back to lspci to get a human-readable name
-                    let pci_slot = device_path.file_name()
+                    let pci_slot = device_path
+                        .file_name()
                         .and_then(|_| {
                             // Read the uevent to get PCI_SLOT_NAME
                             std::fs::read_to_string(device_path.join("uevent")).ok()
@@ -765,11 +782,7 @@ impl SystemInfoProvider for LinuxSystemInfo {
                 // Intel and others: use kernel version as driver version
                 std::fs::read_to_string("/proc/version")
                     .ok()
-                    .and_then(|s| {
-                        s.split_whitespace()
-                            .nth(2)
-                            .map(|v| v.to_string())
-                    })
+                    .and_then(|s| s.split_whitespace().nth(2).map(|v| v.to_string()))
                     .unwrap_or_default()
             };
 
@@ -787,16 +800,23 @@ impl SystemInfoProvider for LinuxSystemInfo {
                 if output.status.success() {
                     let lspci_output = String::from_utf8_lossy(&output.stdout);
                     for line in lspci_output.lines() {
-                        if line.contains("VGA") || line.contains("3D controller") || line.contains("Display controller") {
+                        if line.contains("VGA")
+                            || line.contains("3D controller")
+                            || line.contains("Display controller")
+                        {
                             // Parse: "00:02.0 VGA compatible controller: Intel Corporation Device Name"
-                            let name = line.split_once(':')
+                            let name = line
+                                .split_once(':')
                                 .and_then(|(_, rest)| rest.split_once(':'))
                                 .map(|(_, name)| name.trim().to_string())
                                 .unwrap_or_else(|| line.to_string());
 
                             let vendor = if name.contains("NVIDIA") || name.contains("GeForce") {
                                 "NVIDIA".to_string()
-                            } else if name.contains("AMD") || name.contains("Radeon") || name.contains("ATI") {
+                            } else if name.contains("AMD")
+                                || name.contains("Radeon")
+                                || name.contains("ATI")
+                            {
                                 "AMD".to_string()
                             } else if name.contains("Intel") {
                                 "Intel".to_string()
@@ -914,7 +934,6 @@ impl SystemInfoProvider for LinuxSystemInfo {
             let time_to_empty_secs = std::fs::read_to_string(path.join("time_to_empty_avg"))
                 .ok()
                 .and_then(|s| s.trim().parse::<u64>().ok())
-                .map(|secs| secs)
                 .or_else(|| {
                     if status != BatteryStatus::Discharging {
                         return None;
@@ -992,15 +1011,18 @@ impl SystemInfoProvider for LinuxSystemInfo {
                     let rx_bytes = values.first().copied().unwrap_or(0);
                     let tx_bytes = values.get(8).copied().unwrap_or(0);
 
-                    iface_map.insert(name.clone(), NetworkInfo {
-                        name,
-                        mac_address: String::new(),
-                        ipv4: Vec::new(),
-                        ipv6: Vec::new(),
-                        rx_bytes,
-                        tx_bytes,
-                        is_up: false,
-                    });
+                    iface_map.insert(
+                        name.clone(),
+                        NetworkInfo {
+                            name,
+                            mac_address: String::new(),
+                            ipv4: Vec::new(),
+                            ipv6: Vec::new(),
+                            rx_bytes,
+                            tx_bytes,
+                            is_up: false,
+                        },
+                    );
                 }
             }
         }
@@ -1034,15 +1056,19 @@ impl SystemInfoProvider for LinuxSystemInfo {
                         let sa_family = (*ifa.ifa_addr).sa_family;
 
                         // Ensure we have an entry for this interface
-                        let entry = iface_map.entry(name.clone()).or_insert_with(|| NetworkInfo {
-                            name: name.clone(),
-                            mac_address: String::new(),
-                            ipv4: Vec::new(),
-                            ipv6: Vec::new(),
-                            rx_bytes: 0,
-                            tx_bytes: 0,
-                            is_up: (ifa.ifa_flags as u32 & libc::IFF_UP as u32) != 0,
-                        });
+                        #[allow(clippy::unnecessary_cast)]
+                        let iface_is_up = (ifa.ifa_flags & libc::IFF_UP as u32) != 0;
+                        let entry = iface_map
+                            .entry(name.clone())
+                            .or_insert_with(|| NetworkInfo {
+                                name: name.clone(),
+                                mac_address: String::new(),
+                                ipv4: Vec::new(),
+                                ipv6: Vec::new(),
+                                rx_bytes: 0,
+                                tx_bytes: 0,
+                                is_up: iface_is_up,
+                            });
 
                         if sa_family == libc::AF_INET as u16 {
                             let sin = &*(ifa.ifa_addr as *const libc::sockaddr_in);
@@ -1161,9 +1187,7 @@ impl SystemInfoProvider for LinuxSystemInfo {
                         let hwmon_name_path = hwmon_path.join("name");
                         let label = std::fs::read_to_string(&label_path)
                             .or_else(|_| std::fs::read_to_string(&hwmon_name_path))
-                            .unwrap_or_else(|_| {
-                                entry.file_name().to_string_lossy().to_string()
-                            })
+                            .unwrap_or_else(|_| entry.file_name().to_string_lossy().to_string())
                             .trim()
                             .to_string();
 
@@ -1218,8 +1242,8 @@ impl SystemInfoProvider for LinuxSystemInfo {
                 }
 
                 // Read modes (first line is preferred mode)
-                let modes_str = std::fs::read_to_string(connector_path.join("modes"))
-                    .unwrap_or_default();
+                let modes_str =
+                    std::fs::read_to_string(connector_path.join("modes")).unwrap_or_default();
                 let first_mode = modes_str.lines().next().unwrap_or("");
 
                 let (width, height) = if let Some((w, h)) = first_mode.split_once('x') {
@@ -1232,7 +1256,8 @@ impl SystemInfoProvider for LinuxSystemInfo {
                     continue;
                 }
 
-                let connector_name = name.split_once('-')
+                let connector_name = name
+                    .split_once('-')
                     .map(|(_, rest)| rest.to_string())
                     .unwrap_or(name.clone());
 
