@@ -1,0 +1,72 @@
+[package]
+name = "tauri-plugin-system"
+version = "0.1.0"
+authors = ["Taiizor <taiizor@vegalya.com>"]
+description = "Comprehensive cross-platform system information plugin for Tauri applications. Provides CPU, RAM, disk, GPU, battery, network, thermal, display, and OS information through native platform APIs."
+edition = "2021"
+rust-version = "1.77.2"
+exclude = ["/examples", "/dist-js", "/guest-js", "/node_modules"]
+links = "tauri-plugin-system"
+license = "MIT"
+repository = "https://github.com/Taiizor/tauri-plugin-system"
+readme = "README.md"
+
+[package.metadata.docs.rs]
+rustc-args = ["--cfg", "docsrs"]
+rustdoc-args = ["--cfg", "docsrs"]
+
+[package.metadata.platforms.support]
+windows = { level = "full", notes = "" }
+linux = { level = "full", notes = "" }
+macos = { level = "full", notes = "" }
+android = { level = "none", notes = "Future support planned" }
+ios = { level = "none", notes = "Future support planned" }
+
+[features]
+default = ["cpu", "memory", "disk", "os"]
+cpu = []
+memory = []
+disk = []
+gpu = []
+battery = []
+network = []
+thermal = []
+display = []
+os = []
+all = ["cpu", "memory", "disk", "gpu", "battery", "network", "thermal", "display", "os"]
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tauri = { version = "2.9.4" }
+thiserror = "2"
+log = "0.4"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_System_SystemInformation",
+    "Win32_System_Power",
+    "Win32_System_Performance",
+    "Win32_System_Registry",
+    "Win32_System_WindowsProgramming",
+    "Win32_System_Threading",
+    "Win32_Networking_WinSock",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Graphics_Dxgi",
+    "Win32_System_Com",
+    "Win32_System_Wmi",
+    "Win32_System_Ole",
+    "Win32_System_Variant",
+    "Wdk_System_SystemInformation",
+    "Wdk_System_SystemServices",
+] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.10"
+mach2 = "0.4"
+libc = "0.2"
+
+[build-dependencies]
+tauri-plugin = { version = "2.5.2", features = ["build"] }

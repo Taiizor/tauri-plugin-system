@@ -1,0 +1,15 @@
+[default]
+description = "Default permissions for the system information plugin"
+permissions = [
+  "allow-get-os-info",
+  "allow-get-cpu-info",
+  "allow-get-cpu-usage",
+  "allow-get-memory-info",
+  "allow-get-disk-info",
+  "allow-get-gpu-info",
+  "allow-get-battery-info",
+  "allow-get-network-info",
+  "allow-get-thermal-info",
+  "allow-get-display-info",
+  "allow-get-all-info"
+]

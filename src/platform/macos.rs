@@ -1,0 +1,567 @@
+use crate::models::*;
+use crate::platform::SystemInfoProvider;
+use std::error::Error as StdError;
+
+pub struct MacOSSystemInfo;
+
+impl MacOSSystemInfo {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+// ─── Sysctl helper functions ───
+
+/// Read a sysctl value as a String (for string-type sysctls like kern.hostname).
+#[cfg(any(feature = "os", feature = "cpu"))]
+fn sysctl_string(name: &str) -> Result<String, Box<dyn StdError>> {
+    use std::ffi::CString;
+
+    let c_name = CString::new(name)?;
+    let mut size: libc::size_t = 0;
+
+    // First call to get buffer size
+    let ret = unsafe {
+        libc::sysctlbyname(
+            c_name.as_ptr(),
+            std::ptr::null_mut(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if ret != 0 {
+        return Err(format!("sysctlbyname size query failed for '{}': errno {}", name, ret).into());
+    }
+    if size == 0 {
+        return Err(format!("sysctlbyname returned zero size for '{}'", name).into());
+    }
+
+    let mut buf: Vec<u8> = vec![0u8; size];
+    let ret = unsafe {
+        libc::sysctlbyname(
+            c_name.as_ptr(),
+            buf.as_mut_ptr() as *mut libc::c_void,
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if ret != 0 {
+        return Err(format!("sysctlbyname read failed for '{}': errno {}", name, ret).into());
+    }
+
+    // Strip trailing null bytes
+    while buf.last() == Some(&0) {
+        buf.pop();
+    }
+
+    Ok(String::from_utf8_lossy(&buf).to_string())
+}
+
+/// Read a sysctl value as a u64 (works for both 32-bit and 64-bit integer sysctls).
+#[cfg(any(feature = "os", feature = "cpu", feature = "memory"))]
+fn sysctl_u64(name: &str) -> Result<u64, Box<dyn StdError>> {
+    use std::ffi::CString;
+
+    let c_name = CString::new(name)?;
+    let mut size: libc::size_t = 0;
+
+    let ret = unsafe {
+        libc::sysctlbyname(
+            c_name.as_ptr(),
+            std::ptr::null_mut(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if ret != 0 {
+        return Err(format!("sysctlbyname size query failed for '{}': errno {}", name, ret).into());
+    }
+
+    match size {
+        4 => {
+            let mut val: u32 = 0;
+            let mut val_size = std::mem::size_of::<u32>();
+            let ret = unsafe {
+                libc::sysctlbyname(
+                    c_name.as_ptr(),
+                    &mut val as *mut u32 as *mut libc::c_void,
+                    &mut val_size,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            if ret != 0 {
+                return Err(format!("sysctlbyname read failed for '{}': errno {}", name, ret).into());
+            }
+            Ok(val as u64)
+        }
+        8 => {
+            let mut val: u64 = 0;
+            let mut val_size = std::mem::size_of::<u64>();
+            let ret = unsafe {
+                libc::sysctlbyname(
+                    c_name.as_ptr(),
+                    &mut val as *mut u64 as *mut libc::c_void,
+                    &mut val_size,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            if ret != 0 {
+                return Err(format!("sysctlbyname read failed for '{}': errno {}", name, ret).into());
+            }
+            Ok(val)
+        }
+        other => Err(format!("Unexpected sysctl size {} for '{}'", other, name).into()),
+    }
+}
+
+/// Read kern.boottime as a timeval struct and return the boot timestamp in seconds.
+#[cfg(feature = "os")]
+fn sysctl_boottime() -> Result<libc::timeval, Box<dyn StdError>> {
+    use std::ffi::CString;
+
+    let c_name = CString::new("kern.boottime")?;
+    let mut tv = libc::timeval {
+        tv_sec: 0,
+        tv_usec: 0,
+    };
+    let mut size = std::mem::size_of::<libc::timeval>();
+
+    let ret = unsafe {
+        libc::sysctlbyname(
+            c_name.as_ptr(),
+            &mut tv as *mut libc::timeval as *mut libc::c_void,
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if ret != 0 {
+        return Err(format!("sysctlbyname failed for kern.boottime: errno {}", ret).into());
+    }
+
+    Ok(tv)
+}
+
+// ─── CPU Usage via Mach host_processor_info ───
+
+#[cfg(feature = "cpu")]
+mod cpu_usage_impl {
+    use std::error::Error as StdError;
+
+    // Mach types and constants
+    // host_processor_info returns per-CPU load ticks in CPU_STATE_MAX slots.
+    pub const CPU_STATE_USER: usize = 0;
+    pub const CPU_STATE_SYSTEM: usize = 1;
+    pub const CPU_STATE_IDLE: usize = 2;
+    pub const CPU_STATE_NICE: usize = 3;
+    pub const CPU_STATE_MAX: usize = 4;
+
+    // HOST_CPU_LOAD_INFO flavor for host_processor_info
+    pub const PROCESSOR_CPU_LOAD_INFO: i32 = 2;
+
+    extern "C" {
+        fn mach_host_self() -> u32;
+        fn host_processor_info(
+            host: u32,
+            flavor: i32,
+            out_processor_count: *mut u32,
+            out_processor_info: *mut *mut i32,
+            out_processor_info_cnt: *mut u32,
+        ) -> i32;
+        fn vm_deallocate(
+            target_task: u32,
+            address: usize,
+            size: usize,
+        ) -> i32;
+        fn mach_task_self() -> u32;
+    }
+
+    /// Represents one snapshot of per-CPU load ticks.
+    pub struct CpuLoadSnapshot {
+        pub per_cpu: Vec<[u32; CPU_STATE_MAX]>,
+    }
+
+    /// Sample the per-CPU load ticks using host_processor_info.
+    pub fn sample_cpu_load() -> Result<CpuLoadSnapshot, Box<dyn StdError>> {
+        let mut processor_count: u32 = 0;
+        let mut info_array: *mut i32 = std::ptr::null_mut();
+        let mut info_count: u32 = 0;
+
+        let host = unsafe { mach_host_self() };
+        let kr = unsafe {
+            host_processor_info(
+                host,
+                PROCESSOR_CPU_LOAD_INFO,
+                &mut processor_count,
+                &mut info_array,
+                &mut info_count,
+            )
+        };
+
+        if kr != 0 {
+            return Err(format!("host_processor_info failed with kern_return {}", kr).into());
+        }
+
+        let num_cpus = processor_count as usize;
+        let mut per_cpu = Vec::with_capacity(num_cpus);
+
+        for i in 0..num_cpus {
+            let base = i * CPU_STATE_MAX;
+            let ticks: [u32; CPU_STATE_MAX] = unsafe {
+                [
+                    *info_array.add(base + CPU_STATE_USER) as u32,
+                    *info_array.add(base + CPU_STATE_SYSTEM) as u32,
+                    *info_array.add(base + CPU_STATE_IDLE) as u32,
+                    *info_array.add(base + CPU_STATE_NICE) as u32,
+                ]
+            };
+            per_cpu.push(ticks);
+        }
+
+        // Deallocate the info array returned by Mach
+        unsafe {
+            vm_deallocate(
+                mach_task_self(),
+                info_array as usize,
+                (info_count as usize) * std::mem::size_of::<i32>(),
+            );
+        }
+
+        Ok(CpuLoadSnapshot { per_cpu })
+    }
+}
+
+// ─── Memory info via Mach vm_statistics64 ───
+
+#[cfg(feature = "memory")]
+mod memory_impl {
+    use std::error::Error as StdError;
+
+    // vm_statistics64 struct (matching the Mach kernel definition)
+    #[repr(C)]
+    #[derive(Default)]
+    pub struct VMStatistics64 {
+        pub free_count: u32,
+        pub active_count: u32,
+        pub inactive_count: u32,
+        pub wire_count: u32,
+        pub zero_fill_count: u64,
+        pub reactivations: u64,
+        pub pageins: u64,
+        pub pageouts: u64,
+        pub faults: u64,
+        pub cow_faults: u64,
+        pub lookups: u64,
+        pub hits: u64,
+        pub purges: u64,
+        pub purgeable_count: u32,
+        pub speculative_count: u32,
+        pub decompressions: u64,
+        pub compressions: u64,
+        pub swapins: u64,
+        pub swapouts: u64,
+        pub compressor_page_count: u32,
+        pub throttled_count: u32,
+        pub external_page_count: u32,
+        pub internal_page_count: u32,
+        pub total_uncompressed_pages_in_compressor: u64,
+    }
+
+    // HOST_VM_INFO64 flavor = 4
+    pub const HOST_VM_INFO64: i32 = 4;
+    pub const HOST_VM_INFO64_COUNT: u32 =
+        (std::mem::size_of::<VMStatistics64>() / std::mem::size_of::<i32>()) as u32;
+
+    extern "C" {
+        fn mach_host_self() -> u32;
+        fn host_statistics64(
+            host_priv: u32,
+            flavor: i32,
+            host_info_out: *mut VMStatistics64,
+            host_info_out_cnt: *mut u32,
+        ) -> i32;
+        fn host_page_size(host: u32, out_page_size: *mut u32) -> i32;
+    }
+
+    /// Swap usage struct matching macOS xsw_usage
+    #[repr(C)]
+    #[derive(Default)]
+    pub struct XswUsage {
+        pub xsu_total: u64,
+        pub xsu_avail: u64,
+        pub xsu_used: u64,
+        pub xsu_pagesize: u32,
+        pub xsu_encrypted: bool,
+    }
+
+    pub struct MemoryStats {
+        pub free_count: u64,
+        pub active_count: u64,
+        pub inactive_count: u64,
+        pub wire_count: u64,
+        pub purgeable_count: u64,
+        pub speculative_count: u64,
+        pub compressor_page_count: u64,
+        pub page_size: u64,
+    }
+
+    pub fn get_vm_statistics() -> Result<MemoryStats, Box<dyn StdError>> {
+        let host = unsafe { mach_host_self() };
+
+        // Get page size
+        let mut page_size: u32 = 0;
+        let kr = unsafe { host_page_size(host, &mut page_size) };
+        if kr != 0 {
+            return Err(format!("host_page_size failed: kern_return {}", kr).into());
+        }
+
+        // Get vm statistics
+        let mut vm_stat = VMStatistics64::default();
+        let mut count = HOST_VM_INFO64_COUNT;
+        let kr = unsafe { host_statistics64(host, HOST_VM_INFO64, &mut vm_stat, &mut count) };
+        if kr != 0 {
+            return Err(format!("host_statistics64 failed: kern_return {}", kr).into());
+        }
+
+        Ok(MemoryStats {
+            free_count: vm_stat.free_count as u64,
+            active_count: vm_stat.active_count as u64,
+            inactive_count: vm_stat.inactive_count as u64,
+            wire_count: vm_stat.wire_count as u64,
+            purgeable_count: vm_stat.purgeable_count as u64,
+            speculative_count: vm_stat.speculative_count as u64,
+            compressor_page_count: vm_stat.compressor_page_count as u64,
+            page_size: page_size as u64,
+        })
+    }
+
+    pub fn get_swap_usage() -> Result<(u64, u64), Box<dyn StdError>> {
+        use std::ffi::CString;
+
+        let c_name = CString::new("vm.swapusage")?;
+        let mut usage = XswUsage::default();
+        let mut size = std::mem::size_of::<XswUsage>();
+
+        let ret = unsafe {
+            libc::sysctlbyname(
+                c_name.as_ptr(),
+                &mut usage as *mut XswUsage as *mut libc::c_void,
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if ret != 0 {
+            return Err(format!("sysctlbyname failed for vm.swapusage: errno {}", ret).into());
+        }
+
+        Ok((usage.xsu_total, usage.xsu_used))
+    }
+}
+
+// ─── SystemInfoProvider Implementation ───
+
+impl SystemInfoProvider for MacOSSystemInfo {
+    #[cfg(feature = "os")]
+    fn os_info(&self) -> Result<OsInfo, Box<dyn StdError>> {
+        // OS version (e.g., "14.2.1")
+        let version = sysctl_string("kern.osproductversion")
+            .unwrap_or_else(|_| "unknown".to_string());
+
+        // Build number (e.g., "23C71")
+        let build = sysctl_string("kern.osversion")
+            .unwrap_or_else(|_| "unknown".to_string());
+
+        // Full version string (e.g., "macOS 14.2.1 (23C71)")
+        let full_version = format!("macOS {} ({})", version, build);
+
+        // Hostname
+        let hostname = sysctl_string("kern.hostname")
+            .unwrap_or_else(|_| "unknown".to_string());
+
+        // Architecture
+        let arch = std::env::consts::ARCH.to_string();
+
+        // Uptime: current time minus boot time
+        let uptime_secs = match sysctl_boottime() {
+            Ok(tv) => {
+                let now = unsafe { libc::time(std::ptr::null_mut()) };
+                let boot = tv.tv_sec;
+                if now > boot {
+                    (now - boot) as u64
+                } else {
+                    0
+                }
+            }
+            Err(_) => 0,
+        };
+
+        // Username
+        let username = std::env::var("USER").unwrap_or_else(|_| "unknown".to_string());
+
+        Ok(OsInfo {
+            name: "macOS".to_string(),
+            version,
+            full_version,
+            hostname,
+            arch,
+            uptime_secs,
+            username,
+        })
+    }
+
+    #[cfg(feature = "cpu")]
+    fn cpu_info(&self) -> Result<CpuInfo, Box<dyn StdError>> {
+        // CPU model (e.g., "Apple M1 Pro" or "Intel(R) Core(TM) i9-9880H")
+        let model = sysctl_string("machdep.cpu.brand_string")
+            .unwrap_or_else(|_| "Unknown CPU".to_string());
+
+        // CPU vendor (e.g., "GenuineIntel" or "Apple")
+        // On Apple Silicon, machdep.cpu.vendor may not exist
+        let vendor = sysctl_string("machdep.cpu.vendor")
+            .unwrap_or_else(|_| {
+                // Fallback: if the model contains "Apple", use "Apple"
+                if model.contains("Apple") {
+                    "Apple".to_string()
+                } else {
+                    "Unknown".to_string()
+                }
+            });
+
+        // Physical cores
+        let cores = sysctl_u64("hw.physicalcpu")
+            .unwrap_or(0) as u32;
+
+        // Logical cores (threads)
+        let threads = sysctl_u64("hw.logicalcpu")
+            .unwrap_or(0) as u32;
+
+        // Architecture
+        let arch = std::env::consts::ARCH.to_string();
+
+        // CPU frequency in MHz
+        // hw.cpufrequency returns Hz; divide by 1,000,000 to get MHz
+        // On Apple Silicon this sysctl may not exist, so fall back to 0
+        let frequency_mhz = sysctl_u64("hw.cpufrequency")
+            .map(|hz| hz / 1_000_000)
+            .unwrap_or(0);
+
+        Ok(CpuInfo {
+            model,
+            vendor,
+            cores,
+            threads,
+            arch,
+            frequency_mhz,
+        })
+    }
+
+    #[cfg(feature = "cpu")]
+    fn cpu_usage(&self) -> Result<Vec<f64>, Box<dyn StdError>> {
+        use cpu_usage_impl::*;
+
+        // Take first sample
+        let snap1 = sample_cpu_load()?;
+
+        // Sleep 100ms between samples
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        // Take second sample
+        let snap2 = sample_cpu_load()?;
+
+        let num_cpus = snap1.per_cpu.len().min(snap2.per_cpu.len());
+        let mut usage = Vec::with_capacity(num_cpus);
+
+        for i in 0..num_cpus {
+            let t1 = &snap1.per_cpu[i];
+            let t2 = &snap2.per_cpu[i];
+
+            let user_delta = t2[CPU_STATE_USER].wrapping_sub(t1[CPU_STATE_USER]) as f64;
+            let system_delta = t2[CPU_STATE_SYSTEM].wrapping_sub(t1[CPU_STATE_SYSTEM]) as f64;
+            let idle_delta = t2[CPU_STATE_IDLE].wrapping_sub(t1[CPU_STATE_IDLE]) as f64;
+            let nice_delta = t2[CPU_STATE_NICE].wrapping_sub(t1[CPU_STATE_NICE]) as f64;
+
+            let total = user_delta + system_delta + idle_delta + nice_delta;
+            if total > 0.0 {
+                let active = user_delta + system_delta + nice_delta;
+                let pct = (active / total) * 100.0;
+                usage.push(pct.max(0.0).min(100.0));
+            } else {
+                usage.push(0.0);
+            }
+        }
+
+        Ok(usage)
+    }
+
+    #[cfg(feature = "memory")]
+    fn memory_info(&self) -> Result<MemoryInfo, Box<dyn StdError>> {
+        // Total physical memory
+        let total_bytes = sysctl_u64("hw.memsize")?;
+
+        // Get VM statistics from Mach
+        let stats = memory_impl::get_vm_statistics()?;
+        let page_size = stats.page_size;
+
+        // Available = free + inactive (pages that can be reclaimed)
+        // This matches what macOS reports as "available" memory
+        let free_pages = stats.free_count + stats.speculative_count;
+        let available_bytes = (free_pages + stats.inactive_count + stats.purgeable_count) * page_size;
+
+        // Free = just the truly free pages (free_count * page_size)
+        let free_bytes = free_pages * page_size;
+
+        // Used = total - available
+        let used_bytes = total_bytes.saturating_sub(available_bytes);
+
+        // Swap info
+        let (swap_total_bytes, swap_used_bytes) = memory_impl::get_swap_usage()
+            .unwrap_or((0, 0));
+
+        Ok(MemoryInfo {
+            total_bytes,
+            used_bytes,
+            free_bytes,
+            available_bytes,
+            swap_total_bytes,
+            swap_used_bytes,
+        })
+    }
+
+    // ─── Stubs for unimplemented features ───
+
+    #[cfg(feature = "disk")]
+    fn disk_info(&self) -> Result<Vec<DiskInfo>, Box<dyn StdError>> {
+        Err("Disk info not yet implemented".into())
+    }
+
+    #[cfg(feature = "gpu")]
+    fn gpu_info(&self) -> Result<Vec<GpuInfo>, Box<dyn StdError>> {
+        Err("GPU info not yet implemented".into())
+    }
+
+    #[cfg(feature = "battery")]
+    fn battery_info(&self) -> Result<Option<BatteryInfo>, Box<dyn StdError>> {
+        Err("Battery info not yet implemented".into())
+    }
+
+    #[cfg(feature = "network")]
+    fn network_info(&self) -> Result<Vec<NetworkInfo>, Box<dyn StdError>> {
+        Err("Network info not yet implemented".into())
+    }
+
+    #[cfg(feature = "thermal")]
+    fn thermal_info(&self) -> Result<Vec<ThermalInfo>, Box<dyn StdError>> {
+        Err("Thermal info not yet implemented".into())
+    }
+
+    #[cfg(feature = "display")]
+    fn display_info(&self) -> Result<Vec<DisplayInfo>, Box<dyn StdError>> {
+        Err("Display info not yet implemented".into())
+    }
+}
