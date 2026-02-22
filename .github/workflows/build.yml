@@ -1,0 +1,93 @@
+name: Build
+
+on:
+  push:
+    branches:
+      - develop
+    paths:
+      - "**/*.rs"
+      - "**/Cargo.toml"
+      - ".github/workflows/build.yml"
+  pull_request:
+    branches:
+      - develop
+    paths:
+      - "**/*.rs"
+      - "**/Cargo.toml"
+      - ".github/workflows/build.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - platform: macos-latest
+            target: aarch64-apple-darwin
+          - platform: macos-latest
+            target: x86_64-apple-darwin
+          - platform: windows-latest
+            target: x86_64-pc-windows-msvc
+
+    runs-on: ${{ matrix.platform }}
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install dependencies (Ubuntu)
+        if: matrix.platform == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+
+      - name: Build (default features)
+        env:
+          RUSTFLAGS: "-D warnings"
+        run: cargo build --target ${{ matrix.target }}
+
+      - name: Build (all features)
+        env:
+          RUSTFLAGS: "-D warnings"
+        run: cargo build --all-features --target ${{ matrix.target }}
+
+  feature-check:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install webkit2gtk
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y webkit2gtk-4.1
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check individual features
+        env:
+          RUSTFLAGS: "-D warnings"
+        run: |
+          for feature in os cpu memory disk gpu battery network thermal display; do
+            echo "::group::Checking feature: $feature"
+            cargo check --no-default-features --features "$feature"
+            echo "::endgroup::"
+          done
