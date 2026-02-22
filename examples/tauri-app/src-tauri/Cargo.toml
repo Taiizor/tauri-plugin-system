@@ -1,0 +1,21 @@
+[package]
+name = "tauri-plugin-system-example"
+version = "0.0.0"
+description = "Example app demonstrating tauri-plugin-system"
+authors = ["Taiizor"]
+edition = "2021"
+rust-version = "1.77.2"
+publish = false
+
+[lib]
+name = "tauri_plugin_system_example_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.0", features = [] }
+
+[dependencies]
+tauri = { version = "2.9.4", features = [] }
+tauri-plugin-system = { path = "../../../", features = ["all"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"

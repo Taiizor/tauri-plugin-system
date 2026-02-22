@@ -1,0 +1,8 @@
+{
+  "name": "tauri-plugin-system-example",
+  "private": true,
+  "version": "0.0.0",
+  "scripts": {
+    "tauri": "tauri"
+  }
+}
