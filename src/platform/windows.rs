@@ -412,7 +412,10 @@ fn detect_disk_kind_for_drive(drive_path: &str) -> DiskKind {
 // ─── CPU Usage via NtQuerySystemInformation ───
 
 #[cfg(feature = "cpu")]
-fn query_cpu_times() -> Result<Vec<(i64, i64, i64)>, Box<dyn StdError>> {
+type CpuTimesResult = Result<Vec<(i64, i64, i64)>, Box<dyn StdError>>;
+
+#[cfg(feature = "cpu")]
+fn query_cpu_times() -> CpuTimesResult {
     use windows::Win32::System::WindowsProgramming::SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION;
     use windows::Wdk::System::SystemInformation::NtQuerySystemInformation;
     use windows::Wdk::System::SystemInformation::SYSTEM_INFORMATION_CLASS;
@@ -603,7 +606,7 @@ impl SystemInfoProvider for WindowsSystemInfo {
                 let active = total - idle_delta;
                 let pct = (active / total) * 100.0;
                 // Clamp to [0.0, 100.0]
-                usage.push(pct.max(0.0).min(100.0));
+                usage.push(pct.clamp(0.0, 100.0));
             } else {
                 usage.push(0.0);
             }
@@ -852,7 +855,75 @@ impl SystemInfoProvider for WindowsSystemInfo {
 
     #[cfg(feature = "battery")]
     fn battery_info(&self) -> Result<Option<BatteryInfo>, Box<dyn StdError>> {
-        Err("Battery info not yet implemented".into())
+        use windows::Win32::System::Power::GetSystemPowerStatus;
+        use windows::Win32::System::Power::SYSTEM_POWER_STATUS;
+
+        unsafe {
+            let mut power_status = SYSTEM_POWER_STATUS::default();
+            GetSystemPowerStatus(&mut power_status)?;
+
+            // BatteryFlag == 128 means no system battery
+            if power_status.BatteryFlag == 128 {
+                return Ok(None);
+            }
+
+            // BatteryLifePercent: 0-100 or 255 for unknown
+            let charge_percent = if power_status.BatteryLifePercent == 255 {
+                0.0
+            } else {
+                power_status.BatteryLifePercent as f64
+            };
+
+            // Determine battery status from ACLineStatus and BatteryFlag
+            let status = if power_status.BatteryFlag & 8 != 0 {
+                // Bit 3: charging
+                BatteryStatus::Charging
+            } else if power_status.ACLineStatus == 1 {
+                // On AC but not charging
+                if charge_percent >= 100.0 {
+                    BatteryStatus::Full
+                } else {
+                    BatteryStatus::NotCharging
+                }
+            } else if power_status.ACLineStatus == 0 {
+                BatteryStatus::Discharging
+            } else {
+                BatteryStatus::Unknown
+            };
+
+            // BatteryLifeTime: seconds of remaining battery life, or u32::MAX (-1 as unsigned) if unknown
+            let time_to_empty_secs = if power_status.BatteryLifeTime != u32::MAX {
+                Some(power_status.BatteryLifeTime as u64)
+            } else {
+                None
+            };
+
+            // BatteryFullLifeTime: seconds of full battery life, or u32::MAX if unknown
+            let time_to_full_secs = if power_status.BatteryFullLifeTime != u32::MAX
+                && status == BatteryStatus::Charging
+            {
+                // Estimate time to full from full life time and current charge
+                if charge_percent > 0.0 && charge_percent < 100.0 {
+                    let full_time = power_status.BatteryFullLifeTime as f64;
+                    Some(((100.0 - charge_percent) / 100.0 * full_time) as u64)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            Ok(Some(BatteryInfo {
+                charge_percent,
+                status,
+                health_percent: None,
+                cycle_count: None,
+                design_capacity_mwh: None,
+                full_charge_capacity_mwh: None,
+                time_to_empty_secs,
+                time_to_full_secs,
+            }))
+        }
     }
 
     // ─── Network Info ───
@@ -954,8 +1025,7 @@ impl SystemInfoProvider for WindowsSystemInfo {
                 let mut tx_bytes: u64 = 0;
                 let if_index = adapter.Anonymous1.Anonymous.IfIndex;
                 if if_index != 0 {
-                    let mut row = MIB_IF_ROW2::default();
-                    row.InterfaceIndex = if_index;
+                    let mut row = MIB_IF_ROW2 { InterfaceIndex: if_index, ..Default::default() };
                     if GetIfEntry2(&mut row).is_ok() {
                         rx_bytes = row.InOctets;
                         tx_bytes = row.OutOctets;
@@ -981,7 +1051,11 @@ impl SystemInfoProvider for WindowsSystemInfo {
 
     #[cfg(feature = "thermal")]
     fn thermal_info(&self) -> Result<Vec<ThermalInfo>, Box<dyn StdError>> {
-        Err("Thermal info not yet implemented".into())
+        // Thermal sensor access on Windows requires WMI (COM initialization,
+        // MSAcpi_ThermalZoneTemperature queries) which is complex and often
+        // requires administrator privileges. Return an empty Vec for now.
+        // A WMI-based implementation can be added in the future.
+        Ok(vec![])
     }
 
     #[cfg(feature = "display")]

@@ -757,7 +757,139 @@ impl SystemInfoProvider for MacOSSystemInfo {
 
     #[cfg(feature = "battery")]
     fn battery_info(&self) -> Result<Option<BatteryInfo>, Box<dyn StdError>> {
-        Err("Battery info not yet implemented".into())
+        use std::process::Command;
+
+        let output = Command::new("system_profiler")
+            .args(["SPPowerDataType", "-json"])
+            .output()
+            .map_err(|e| format!("Failed to run system_profiler: {}", e))?;
+
+        if !output.status.success() {
+            return Err("system_profiler returned non-zero exit code".into());
+        }
+
+        let json_str = String::from_utf8_lossy(&output.stdout);
+        let parsed: serde_json::Value = serde_json::from_str(&json_str)
+            .map_err(|e| format!("Failed to parse system_profiler JSON: {}", e))?;
+
+        let power_array = match parsed.get("SPPowerDataType").and_then(|v| v.as_array()) {
+            Some(arr) => arr,
+            None => return Ok(None), // No power data means no battery
+        };
+
+        // Find battery charge info and health info within the power data
+        let mut charge_percent: Option<f64> = None;
+        let mut is_charging = false;
+        let mut is_connected = false;
+        let mut cycle_count: Option<u32> = None;
+        let mut health_percent: Option<f64> = None;
+        let mut max_capacity: Option<u64> = None;
+        let mut design_capacity: Option<u64> = None;
+        let mut has_battery = false;
+
+        for entry in power_array {
+            // Check for battery charge info section
+            if let Some(charge_info) = entry.get("sppower_battery_charge_info") {
+                has_battery = true;
+
+                // Current charge level
+                if let Some(current) = charge_info.get("sppower_battery_current_capacity")
+                    .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+                {
+                    if let Some(max) = charge_info.get("sppower_battery_max_capacity")
+                        .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+                    {
+                        max_capacity = Some(max);
+                        if max > 0 {
+                            charge_percent = Some((current as f64 / max as f64) * 100.0);
+                        }
+                    }
+                }
+
+                // Charging state
+                if let Some(charging) = charge_info.get("sppower_battery_is_charging") {
+                    is_charging = charging.as_str() == Some("TRUE")
+                        || charging.as_bool() == Some(true);
+                }
+            }
+
+            // Check for battery health info section
+            if let Some(health_info) = entry.get("sppower_battery_health_info") {
+                has_battery = true;
+
+                // Cycle count
+                if let Some(cycles) = health_info.get("sppower_battery_cycle_count")
+                    .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+                {
+                    cycle_count = Some(cycles as u32);
+                }
+
+                // Maximum capacity percent (battery health)
+                if let Some(max_pct) = health_info.get("sppower_battery_health_maximum_capacity")
+                    .and_then(|v| {
+                        v.as_str().and_then(|s| s.trim_end_matches('%').parse::<f64>().ok())
+                            .or_else(|| v.as_f64())
+                            .or_else(|| v.as_u64().map(|n| n as f64))
+                    })
+                {
+                    health_percent = Some(max_pct);
+                }
+            }
+
+            // Check for AC charger info (connected state)
+            if let Some(ac_info) = entry.get("sppower_ac_charger_information") {
+                if let Some(connected) = ac_info.get("sppower_battery_charger_connected") {
+                    is_connected = connected.as_str() == Some("TRUE")
+                        || connected.as_bool() == Some(true);
+                }
+            }
+
+            // Alternative: top-level fields in some macOS versions
+            if entry.get("sppower_battery_model_info").is_some() {
+                has_battery = true;
+            }
+
+            // Try to get design capacity from battery model info
+            if let Some(model_info) = entry.get("sppower_battery_model_info") {
+                if let Some(dc) = model_info.get("sppower_battery_design_capacity")
+                    .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+                {
+                    design_capacity = Some(dc);
+                }
+            }
+        }
+
+        if !has_battery {
+            return Ok(None);
+        }
+
+        let status = if is_charging {
+            BatteryStatus::Charging
+        } else if is_connected {
+            if charge_percent.unwrap_or(0.0) >= 100.0 {
+                BatteryStatus::Full
+            } else {
+                BatteryStatus::NotCharging
+            }
+        } else {
+            BatteryStatus::Discharging
+        };
+
+        // Convert capacities to mWh (system_profiler reports in mAh typically;
+        // without voltage info we store the raw value as an approximation)
+        let design_capacity_mwh = design_capacity;
+        let full_charge_capacity_mwh = max_capacity;
+
+        Ok(Some(BatteryInfo {
+            charge_percent: charge_percent.unwrap_or(0.0),
+            status,
+            health_percent,
+            cycle_count,
+            design_capacity_mwh,
+            full_charge_capacity_mwh,
+            time_to_empty_secs: None, // system_profiler doesn't reliably provide this
+            time_to_full_secs: None,
+        }))
     }
 
     // ─── Network Info ───
@@ -887,7 +1019,12 @@ impl SystemInfoProvider for MacOSSystemInfo {
 
     #[cfg(feature = "thermal")]
     fn thermal_info(&self) -> Result<Vec<ThermalInfo>, Box<dyn StdError>> {
-        Err("Thermal info not yet implemented".into())
+        // Thermal sensor access on macOS requires IOKit SMC (AppleSMC) which
+        // involves privileged access to the System Management Controller via
+        // IOKit framework calls (SMCReadKey). This is complex and often
+        // requires elevated privileges. Return an empty Vec for now.
+        // An IOKit SMC-based implementation can be added in the future.
+        Ok(vec![])
     }
 
     #[cfg(feature = "display")]

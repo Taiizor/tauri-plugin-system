@@ -824,7 +824,151 @@ impl SystemInfoProvider for LinuxSystemInfo {
 
     #[cfg(feature = "battery")]
     fn battery_info(&self) -> Result<Option<BatteryInfo>, Box<dyn StdError>> {
-        Err("Battery info not yet implemented".into())
+        // Look for battery entries in /sys/class/power_supply/
+        let power_supply_dir = std::path::Path::new("/sys/class/power_supply");
+        if !power_supply_dir.exists() {
+            return Ok(None);
+        }
+
+        let entries = std::fs::read_dir(power_supply_dir)
+            .map_err(|e| format!("Failed to read /sys/class/power_supply: {}", e))?;
+
+        for entry in entries.filter_map(|e| e.ok()) {
+            let path = entry.path();
+
+            // Check if this is a battery (type == "Battery")
+            let type_path = path.join("type");
+            let supply_type = match std::fs::read_to_string(&type_path) {
+                Ok(t) => t.trim().to_string(),
+                Err(_) => continue,
+            };
+
+            if supply_type != "Battery" {
+                continue;
+            }
+
+            // charge_percent from "capacity" file (0-100)
+            let charge_percent = std::fs::read_to_string(path.join("capacity"))
+                .ok()
+                .and_then(|s| s.trim().parse::<f64>().ok())
+                .unwrap_or(0.0);
+
+            // Battery status from "status" file
+            let status_str = std::fs::read_to_string(path.join("status"))
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            let status = match status_str.as_str() {
+                "Charging" => BatteryStatus::Charging,
+                "Discharging" => BatteryStatus::Discharging,
+                "Full" => BatteryStatus::Full,
+                "Not charging" => BatteryStatus::NotCharging,
+                _ => BatteryStatus::Unknown,
+            };
+
+            // Cycle count
+            let cycle_count = std::fs::read_to_string(path.join("cycle_count"))
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok());
+
+            // Design capacity: energy_full_design is in uWh, convert to mWh
+            // Some systems use charge_full_design (uAh) instead
+            let design_capacity_mwh = std::fs::read_to_string(path.join("energy_full_design"))
+                .ok()
+                .and_then(|s| s.trim().parse::<u64>().ok())
+                .map(|uwh| uwh / 1000)
+                .or_else(|| {
+                    // Fallback: charge_full_design (uAh) * voltage_min_design (uV) / 1e9 => mWh
+                    let charge_uah = std::fs::read_to_string(path.join("charge_full_design"))
+                        .ok()
+                        .and_then(|s| s.trim().parse::<u64>().ok())?;
+                    let voltage_uv = std::fs::read_to_string(path.join("voltage_min_design"))
+                        .ok()
+                        .and_then(|s| s.trim().parse::<u64>().ok())
+                        .unwrap_or(3_700_000); // default ~3.7V
+                    Some(charge_uah * voltage_uv / 1_000_000_000)
+                });
+
+            // Full charge capacity: energy_full is in uWh, convert to mWh
+            let full_charge_capacity_mwh = std::fs::read_to_string(path.join("energy_full"))
+                .ok()
+                .and_then(|s| s.trim().parse::<u64>().ok())
+                .map(|uwh| uwh / 1000)
+                .or_else(|| {
+                    let charge_uah = std::fs::read_to_string(path.join("charge_full"))
+                        .ok()
+                        .and_then(|s| s.trim().parse::<u64>().ok())?;
+                    let voltage_uv = std::fs::read_to_string(path.join("voltage_min_design"))
+                        .ok()
+                        .and_then(|s| s.trim().parse::<u64>().ok())
+                        .unwrap_or(3_700_000);
+                    Some(charge_uah * voltage_uv / 1_000_000_000)
+                });
+
+            // Health percent: full_charge / design_capacity * 100
+            let health_percent = match (full_charge_capacity_mwh, design_capacity_mwh) {
+                (Some(full), Some(design)) if design > 0 => {
+                    Some((full as f64 / design as f64) * 100.0)
+                }
+                _ => None,
+            };
+
+            // Time to empty: try time_to_empty_avg first, then compute from energy_now / power_now
+            let time_to_empty_secs = std::fs::read_to_string(path.join("time_to_empty_avg"))
+                .ok()
+                .and_then(|s| s.trim().parse::<u64>().ok())
+                .map(|secs| secs)
+                .or_else(|| {
+                    if status != BatteryStatus::Discharging {
+                        return None;
+                    }
+                    let energy_now = std::fs::read_to_string(path.join("energy_now"))
+                        .ok()
+                        .and_then(|s| s.trim().parse::<u64>().ok())?;
+                    let power_now = std::fs::read_to_string(path.join("power_now"))
+                        .ok()
+                        .and_then(|s| s.trim().parse::<u64>().ok())
+                        .filter(|&p| p > 0)?;
+                    Some(energy_now * 3600 / power_now)
+                });
+
+            // Time to full: try time_to_full_avg, then compute from remaining capacity / power
+            let time_to_full_secs = std::fs::read_to_string(path.join("time_to_full_avg"))
+                .ok()
+                .and_then(|s| s.trim().parse::<u64>().ok())
+                .or_else(|| {
+                    if status != BatteryStatus::Charging {
+                        return None;
+                    }
+                    let energy_now = std::fs::read_to_string(path.join("energy_now"))
+                        .ok()
+                        .and_then(|s| s.trim().parse::<u64>().ok())?;
+                    let energy_full = std::fs::read_to_string(path.join("energy_full"))
+                        .ok()
+                        .and_then(|s| s.trim().parse::<u64>().ok())?;
+                    let power_now = std::fs::read_to_string(path.join("power_now"))
+                        .ok()
+                        .and_then(|s| s.trim().parse::<u64>().ok())
+                        .filter(|&p| p > 0)?;
+                    let remaining = energy_full.saturating_sub(energy_now);
+                    Some(remaining * 3600 / power_now)
+                });
+
+            // Return the first battery found
+            return Ok(Some(BatteryInfo {
+                charge_percent,
+                status,
+                health_percent,
+                cycle_count,
+                design_capacity_mwh,
+                full_charge_capacity_mwh,
+                time_to_empty_secs,
+                time_to_full_secs,
+            }));
+        }
+
+        // No battery found
+        Ok(None)
     }
 
     // ─── Network Info ───
@@ -936,7 +1080,114 @@ impl SystemInfoProvider for LinuxSystemInfo {
 
     #[cfg(feature = "thermal")]
     fn thermal_info(&self) -> Result<Vec<ThermalInfo>, Box<dyn StdError>> {
-        Err("Thermal info not yet implemented".into())
+        let mut thermals = Vec::new();
+
+        // Read from /sys/class/thermal/thermal_zone*/
+        let thermal_dir = std::path::Path::new("/sys/class/thermal");
+        if let Ok(entries) = std::fs::read_dir(thermal_dir) {
+            for entry in entries.filter_map(|e| e.ok()) {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if !name.starts_with("thermal_zone") {
+                    continue;
+                }
+
+                let zone_path = entry.path();
+
+                // Read temperature (in millidegrees Celsius)
+                let temp_mc = match std::fs::read_to_string(zone_path.join("temp")) {
+                    Ok(s) => match s.trim().parse::<i64>() {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    },
+                    Err(_) => continue,
+                };
+                let temperature_celsius = temp_mc as f64 / 1000.0;
+
+                // Read label (type file)
+                let label = std::fs::read_to_string(zone_path.join("type"))
+                    .unwrap_or_else(|_| name.clone())
+                    .trim()
+                    .to_string();
+
+                // Find critical temperature from trip points
+                let critical_celsius = (0..20u32).find_map(|i| {
+                    let trip_type_path = zone_path.join(format!("trip_point_{}_type", i));
+                    let trip_temp_path = zone_path.join(format!("trip_point_{}_temp", i));
+
+                    let trip_type = std::fs::read_to_string(&trip_type_path).ok()?;
+                    if trip_type.trim() == "critical" {
+                        let trip_temp = std::fs::read_to_string(&trip_temp_path).ok()?;
+                        let mc = trip_temp.trim().parse::<i64>().ok()?;
+                        Some(mc as f64 / 1000.0)
+                    } else {
+                        None
+                    }
+                });
+
+                thermals.push(ThermalInfo {
+                    label,
+                    temperature_celsius,
+                    critical_celsius,
+                });
+            }
+        }
+
+        // Also read from /sys/class/hwmon/hwmon*/
+        let hwmon_dir = std::path::Path::new("/sys/class/hwmon");
+        if let Ok(entries) = std::fs::read_dir(hwmon_dir) {
+            for entry in entries.filter_map(|e| e.ok()) {
+                let hwmon_path = entry.path();
+
+                // Enumerate temp*_input files
+                if let Ok(files) = std::fs::read_dir(&hwmon_path) {
+                    for file in files.filter_map(|f| f.ok()) {
+                        let fname = file.file_name().to_string_lossy().to_string();
+                        if !fname.starts_with("temp") || !fname.ends_with("_input") {
+                            continue;
+                        }
+
+                        // Extract the temp index (e.g., "temp1_input" -> "1")
+                        let idx = &fname[4..fname.len() - 6]; // strip "temp" and "_input"
+
+                        // Read temperature in millidegrees
+                        let temp_mc = match std::fs::read_to_string(file.path()) {
+                            Ok(s) => match s.trim().parse::<i64>() {
+                                Ok(v) => v,
+                                Err(_) => continue,
+                            },
+                            Err(_) => continue,
+                        };
+                        let temperature_celsius = temp_mc as f64 / 1000.0;
+
+                        // Read label: try temp*_label first, fall back to hwmon name
+                        let label_path = hwmon_path.join(format!("temp{}_label", idx));
+                        let hwmon_name_path = hwmon_path.join("name");
+                        let label = std::fs::read_to_string(&label_path)
+                            .or_else(|_| std::fs::read_to_string(&hwmon_name_path))
+                            .unwrap_or_else(|_| {
+                                entry.file_name().to_string_lossy().to_string()
+                            })
+                            .trim()
+                            .to_string();
+
+                        // Read critical temperature
+                        let crit_path = hwmon_path.join(format!("temp{}_crit", idx));
+                        let critical_celsius = std::fs::read_to_string(&crit_path)
+                            .ok()
+                            .and_then(|s| s.trim().parse::<i64>().ok())
+                            .map(|mc| mc as f64 / 1000.0);
+
+                        thermals.push(ThermalInfo {
+                            label,
+                            temperature_celsius,
+                            critical_celsius,
+                        });
+                    }
+                }
+            }
+        }
+
+        Ok(thermals)
     }
 
     #[cfg(feature = "display")]

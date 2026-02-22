@@ -83,7 +83,7 @@ pub struct BatteryInfo {
     pub time_to_full_secs: Option<u64>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum BatteryStatus {
     Charging,
