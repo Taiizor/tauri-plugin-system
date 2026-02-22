@@ -19,8 +19,8 @@ rustdoc-args = ["--cfg", "docsrs"]
 windows = { level = "full", notes = "" }
 linux = { level = "full", notes = "" }
 macos = { level = "full", notes = "" }
-android = { level = "none", notes = "Future support planned" }
-ios = { level = "none", notes = "Future support planned" }
+android = { level = "full", notes = "Native Kotlin implementation via Tauri mobile plugin bridge" }
+ios = { level = "full", notes = "Native Swift implementation via Tauri mobile plugin bridge" }
 
 [features]
 default = ["cpu", "memory", "disk", "os"]

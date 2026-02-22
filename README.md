@@ -18,7 +18,7 @@ A comprehensive cross-platform system information plugin for Tauri v2. Provides 
 - **Display**: Name, resolution, DPI, refresh rate, primary flag
 - **OS**: Name, version, hostname, architecture, uptime, username
 - **Feature Flags**: Enable only the modules you need via Cargo features
-- **Zero Dependencies**: Uses native OS APIs only (Win32/DXGI/WDK, sysctl/IOKit, procfs/sysfs)
+- **Zero Dependencies**: Uses native OS APIs only (Win32/DXGI/WDK, sysctl/IOKit, procfs/sysfs, Android SDK, iOS frameworks)
 - **Type Safety**: Full TypeScript typings for all data structures
 
 ## Platform Support
@@ -28,6 +28,8 @@ A comprehensive cross-platform system information plugin for Tauri v2. Provides 
 | Windows  | Full   | Win32, DXGI, WDK, Registry |
 | macOS    | Full   | sysctl, mach2, system_profiler, IOKit |
 | Linux    | Full   | procfs, sysfs, xrandr, lspci |
+| Android  | Full   | Android SDK, /proc, /sys, EGL/GLES |
+| iOS      | Full   | UIKit, Metal, ProcessInfo, sysctl |
 
 ## Installation
 

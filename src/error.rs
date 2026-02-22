@@ -10,6 +10,8 @@ pub enum Error {
     Platform(String),
     #[error("Feature not supported on this platform")]
     Unsupported,
+    #[error("Plugin invocation error: {0}")]
+    PluginInvoke(String),
 }
 
 impl Serialize for Error {

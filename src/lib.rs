@@ -7,16 +7,21 @@ pub use models::*;
 
 #[cfg(desktop)]
 mod desktop;
+#[cfg(mobile)]
+mod mobile;
 
 mod commands;
 mod error;
 mod models;
+#[cfg(desktop)]
 pub mod platform;
 
 pub use error::{Error, Result};
 
 #[cfg(desktop)]
 use desktop::System;
+#[cfg(mobile)]
+use mobile::System;
 
 pub trait SystemExt<R: Runtime> {
     fn system(&self) -> &System<R>;
@@ -56,6 +61,8 @@ pub fn init<R: Runtime>() -> TauriPlugin<R> {
         .setup(|app, api| {
             #[cfg(desktop)]
             let system = desktop::init(app, api)?;
+            #[cfg(mobile)]
+            let system = mobile::init(app, api)?;
             app.manage(system);
             Ok(())
         })
