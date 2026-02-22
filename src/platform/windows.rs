@@ -231,6 +231,90 @@ fn get_physical_core_count() -> Result<u32, Box<dyn StdError>> {
     }
 }
 
+// ─── Display DPI Helper ───
+
+#[cfg(feature = "display")]
+fn get_display_dpi() -> f64 {
+    use windows::Win32::UI::HiDpi::GetDpiForSystem;
+
+    unsafe {
+        let dpi = GetDpiForSystem();
+        if dpi > 0 {
+            dpi as f64
+        } else {
+            96.0 // default DPI
+        }
+    }
+}
+
+// ─── GPU Registry Helper ───
+
+#[cfg(feature = "gpu")]
+fn read_registry_string_gpu(subkey: &str, value_name: &str) -> Result<String, Box<dyn StdError>> {
+    use windows::Win32::System::Registry::{
+        RegOpenKeyExW, RegQueryValueExW, RegCloseKey, HKEY, HKEY_LOCAL_MACHINE,
+        KEY_READ, REG_VALUE_TYPE,
+    };
+    use windows::core::PCWSTR;
+
+    unsafe {
+        let subkey_wide: Vec<u16> = subkey.encode_utf16().chain(std::iter::once(0)).collect();
+        let value_wide: Vec<u16> = value_name.encode_utf16().chain(std::iter::once(0)).collect();
+
+        let mut hkey = HKEY::default();
+        let result = RegOpenKeyExW(
+            HKEY_LOCAL_MACHINE,
+            PCWSTR(subkey_wide.as_ptr()),
+            0,
+            KEY_READ,
+            &mut hkey,
+        );
+
+        if result.is_err() {
+            return Err(format!("Failed to open registry key: {}", subkey).into());
+        }
+
+        let mut data_type = REG_VALUE_TYPE::default();
+        let mut data_size: u32 = 0;
+        let result = RegQueryValueExW(
+            hkey,
+            PCWSTR(value_wide.as_ptr()),
+            None,
+            Some(&mut data_type),
+            None,
+            Some(&mut data_size),
+        );
+
+        if result.is_err() {
+            let _ = RegCloseKey(hkey);
+            return Err(format!("Failed to query registry value size: {}", value_name).into());
+        }
+
+        let mut buffer: Vec<u8> = vec![0u8; data_size as usize];
+        let result = RegQueryValueExW(
+            hkey,
+            PCWSTR(value_wide.as_ptr()),
+            None,
+            Some(&mut data_type),
+            Some(buffer.as_mut_ptr()),
+            Some(&mut data_size),
+        );
+
+        let _ = RegCloseKey(hkey);
+
+        if result.is_err() {
+            return Err(format!("Failed to read registry value: {}", value_name).into());
+        }
+
+        let wide_slice = std::slice::from_raw_parts(
+            buffer.as_ptr() as *const u16,
+            data_size as usize / 2,
+        );
+        let len = wide_slice.iter().position(|&c| c == 0).unwrap_or(wide_slice.len());
+        Ok(String::from_utf16_lossy(&wide_slice[..len]))
+    }
+}
+
 // ─── SSD/HDD Detection via DeviceIoControl ───
 
 #[cfg(feature = "disk")]
@@ -680,11 +764,90 @@ impl SystemInfoProvider for WindowsSystemInfo {
         Ok(disks)
     }
 
-    // ─── Stubs for unimplemented features ───
+    // ─── GPU Info via DXGI ───
 
     #[cfg(feature = "gpu")]
     fn gpu_info(&self) -> Result<Vec<GpuInfo>, Box<dyn StdError>> {
-        Err("GPU info not yet implemented".into())
+        use windows::Win32::Graphics::Dxgi::{
+            CreateDXGIFactory1, IDXGIFactory1, DXGI_ADAPTER_FLAG_SOFTWARE,
+        };
+
+        let mut gpus = Vec::new();
+
+        unsafe {
+            let factory: IDXGIFactory1 = CreateDXGIFactory1()?;
+
+            let mut adapter_index: u32 = 0;
+            loop {
+                let adapter = match factory.EnumAdapters1(adapter_index) {
+                    Ok(a) => a,
+                    Err(_) => break,
+                };
+                adapter_index += 1;
+
+                let desc = adapter.GetDesc1()?;
+
+                // Skip software adapters (Microsoft Basic Render Driver)
+                if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32) != 0 {
+                    continue;
+                }
+
+                // Convert wide-char description to String
+                let name_len = desc.Description.iter().position(|&c| c == 0)
+                    .unwrap_or(desc.Description.len());
+                let name = String::from_utf16_lossy(&desc.Description[..name_len]);
+
+                // Map VendorId to vendor name
+                let vendor = match desc.VendorId {
+                    0x10DE => "NVIDIA".to_string(),
+                    0x1002 | 0x1022 => "AMD".to_string(),
+                    0x8086 => "Intel".to_string(),
+                    0x106B => "Apple".to_string(),
+                    0x1414 => "Microsoft".to_string(),
+                    0x5143 => "Qualcomm".to_string(),
+                    other => format!("Unknown (0x{:04X})", other),
+                };
+
+                // VRAM in MB
+                let vram_mb = desc.DedicatedVideoMemory as u64 / (1024 * 1024);
+
+                // Attempt to read driver version from registry
+                let driver_version = {
+                    let reg_path = r"SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}";
+                    let mut found_version = String::new();
+                    // Try subkeys 0000, 0001, 0002, etc.
+                    for i in 0..16u32 {
+                        let subkey = format!("{}\\{:04}", reg_path, i);
+                        if let Ok(desc_reg) = read_registry_string_gpu(&subkey, "DriverDesc") {
+                            // Match adapter by name similarity
+                            if name.contains(&desc_reg) || desc_reg.contains(&name) || i == (adapter_index - 1) {
+                                if let Ok(ver) = read_registry_string_gpu(&subkey, "DriverVersion") {
+                                    found_version = ver;
+                                    break;
+                                }
+                            }
+                        }
+                        // If no match by name, just try the index corresponding to adapter order
+                        if found_version.is_empty() && i == (adapter_index - 1) {
+                            if let Ok(ver) = read_registry_string_gpu(&subkey, "DriverVersion") {
+                                found_version = ver;
+                                break;
+                            }
+                        }
+                    }
+                    found_version
+                };
+
+                gpus.push(GpuInfo {
+                    name,
+                    vendor,
+                    vram_mb,
+                    driver_version,
+                });
+            }
+        }
+
+        Ok(gpus)
     }
 
     #[cfg(feature = "battery")]
@@ -823,6 +986,105 @@ impl SystemInfoProvider for WindowsSystemInfo {
 
     #[cfg(feature = "display")]
     fn display_info(&self) -> Result<Vec<DisplayInfo>, Box<dyn StdError>> {
-        Err("Display info not yet implemented".into())
+        use windows::Win32::Graphics::Gdi::{
+            EnumDisplayDevicesW, EnumDisplaySettingsW,
+            DISPLAY_DEVICEW, DEVMODEW,
+            ENUM_CURRENT_SETTINGS, DISPLAY_DEVICE_ACTIVE,
+            DISPLAY_DEVICE_PRIMARY_DEVICE,
+        };
+
+        let mut displays = Vec::new();
+
+        unsafe {
+            let mut device_index: u32 = 0;
+            loop {
+                let mut device = DISPLAY_DEVICEW {
+                    cb: std::mem::size_of::<DISPLAY_DEVICEW>() as u32,
+                    ..Default::default()
+                };
+
+                let ok = EnumDisplayDevicesW(
+                    None,
+                    device_index,
+                    &mut device,
+                    0,
+                );
+                if !ok.as_bool() {
+                    break;
+                }
+                device_index += 1;
+
+                // Skip inactive devices
+                if (device.StateFlags & DISPLAY_DEVICE_ACTIVE) == 0 {
+                    continue;
+                }
+
+                let is_primary = (device.StateFlags & DISPLAY_DEVICE_PRIMARY_DEVICE) != 0;
+
+                // Get device name
+                let name_len = device.DeviceName.iter().position(|&c| c == 0)
+                    .unwrap_or(device.DeviceName.len());
+                let device_name_wide = &device.DeviceName[..name_len];
+                let device_name = String::from_utf16_lossy(device_name_wide);
+
+                // Get friendly name from the monitor device (second level enumeration)
+                let mut monitor_device = DISPLAY_DEVICEW {
+                    cb: std::mem::size_of::<DISPLAY_DEVICEW>() as u32,
+                    ..Default::default()
+                };
+                let device_name_pcwstr = windows::core::PCWSTR(device.DeviceName.as_ptr());
+                let friendly_name = if EnumDisplayDevicesW(
+                    device_name_pcwstr,
+                    0,
+                    &mut monitor_device,
+                    0,
+                ).as_bool() {
+                    let len = monitor_device.DeviceString.iter().position(|&c| c == 0)
+                        .unwrap_or(monitor_device.DeviceString.len());
+                    let s = String::from_utf16_lossy(&monitor_device.DeviceString[..len]);
+                    if s.is_empty() { device_name.clone() } else { s }
+                } else {
+                    device_name.clone()
+                };
+
+                // Get current display settings (resolution, refresh rate)
+                let mut devmode = DEVMODEW {
+                    dmSize: std::mem::size_of::<DEVMODEW>() as u16,
+                    ..Default::default()
+                };
+
+                let settings_ok = EnumDisplaySettingsW(
+                    device_name_pcwstr,
+                    ENUM_CURRENT_SETTINGS,
+                    &mut devmode,
+                );
+                if !settings_ok.as_bool() {
+                    continue;
+                }
+
+                let width = devmode.dmPelsWidth;
+                let height = devmode.dmPelsHeight;
+                let refresh_rate = devmode.dmDisplayFrequency;
+                let refresh_rate_hz = if refresh_rate > 0 && refresh_rate != 1 {
+                    Some(refresh_rate as f64)
+                } else {
+                    None
+                };
+
+                // Get DPI using GetDpiForSystem as a fallback (per-monitor DPI requires HMONITOR)
+                let dpi = get_display_dpi();
+
+                displays.push(DisplayInfo {
+                    name: friendly_name,
+                    width,
+                    height,
+                    dpi,
+                    refresh_rate_hz,
+                    is_primary,
+                });
+            }
+        }
+
+        Ok(displays)
     }
 }

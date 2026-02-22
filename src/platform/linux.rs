@@ -204,6 +204,168 @@ fn parse_proc_meminfo() -> Result<std::collections::HashMap<String, u64>, Box<dy
     Ok(map)
 }
 
+// ─── GPU VRAM Helper for NVIDIA ───
+
+#[cfg(feature = "gpu")]
+fn nvidia_vram_from_proc(_card_num: &str) -> Option<u64> {
+    // Try /proc/driver/nvidia/gpus/*/information
+    if let Ok(entries) = std::fs::read_dir("/proc/driver/nvidia/gpus") {
+        for entry in entries.filter_map(|e| e.ok()) {
+            let info_path = entry.path().join("information");
+            if let Ok(content) = std::fs::read_to_string(&info_path) {
+                for line in content.lines() {
+                    if line.starts_with("Video BIOS") {
+                        continue;
+                    }
+                    if line.contains("Memory") || line.contains("FB Size") {
+                        // Look for lines like "FB Size:    8192 MB"
+                        if let Some((_, val_part)) = line.split_once(':') {
+                            let val_str = val_part.trim();
+                            let parts: Vec<&str> = val_str.split_whitespace().collect();
+                            if let Some(num_str) = parts.first() {
+                                if let Ok(mb) = num_str.parse::<u64>() {
+                                    return Some(mb);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+// ─── Display Info xrandr Parser Helpers ───
+
+#[cfg(feature = "display")]
+fn parse_xrandr_displays() -> Result<Vec<crate::models::DisplayInfo>, Box<dyn std::error::Error>> {
+    use std::process::Command;
+
+    let output = Command::new("xrandr")
+        .arg("--query")
+        .output()
+        .map_err(|e| format!("Failed to run xrandr: {}", e))?;
+
+    if !output.status.success() {
+        return Err("xrandr returned non-zero exit code".into());
+    }
+
+    let xrandr_output = String::from_utf8_lossy(&output.stdout);
+    let mut displays = Vec::new();
+
+    // Parse xrandr output line by line
+    // Connected output lines look like:
+    //   eDP-1 connected primary 1920x1080+0+0 (normal left inverted right x axis y axis) 344mm x 193mm
+    //   HDMI-1 connected 3840x2160+1920+0 (normal left inverted right x axis y axis) 600mm x 340mm
+    // Mode lines follow with resolution and refresh rate:
+    //   1920x1080     60.00*+  59.97    59.96    48.00
+    //   3840x2160     60.00*+
+
+    let mut current_name = String::new();
+    let mut current_is_primary = false;
+    let mut current_width_mm: f64 = 0.0;
+    let mut current_height_mm: f64 = 0.0;
+    let mut current_width: u32 = 0;
+    let mut current_height: u32 = 0;
+    let mut found_active_mode = false;
+    let mut in_connected_output = false;
+
+    for line in xrandr_output.lines() {
+        if line.contains(" connected") {
+            // Save previous display if we were tracking one
+            if in_connected_output && current_width > 0 && current_height > 0 {
+                // This shouldn't happen if we properly capture modes, but just in case
+            }
+
+            in_connected_output = true;
+            found_active_mode = false;
+            current_is_primary = line.contains(" primary ");
+
+            // Extract monitor name (first word)
+            current_name = line.split_whitespace().next().unwrap_or("Unknown").to_string();
+
+            // Extract physical size in mm (e.g., "344mm x 193mm")
+            current_width_mm = 0.0;
+            current_height_mm = 0.0;
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            for (i, part) in parts.iter().enumerate() {
+                if part.ends_with("mm") && i + 2 < parts.len() && parts[i + 1] == "x" && parts[i + 2].ends_with("mm") {
+                    current_width_mm = part.trim_end_matches("mm").parse().unwrap_or(0.0);
+                    current_height_mm = parts[i + 2].trim_end_matches("mm").parse().unwrap_or(0.0);
+                    break;
+                }
+            }
+
+            // Extract resolution from the connected line (e.g., "1920x1080+0+0")
+            current_width = 0;
+            current_height = 0;
+            for part in &parts {
+                if part.contains('x') && part.contains('+') {
+                    // Format: WIDTHxHEIGHT+X+Y
+                    if let Some(res_part) = part.split('+').next() {
+                        if let Some((w, h)) = res_part.split_once('x') {
+                            current_width = w.parse().unwrap_or(0);
+                            current_height = h.parse().unwrap_or(0);
+                        }
+                    }
+                    break;
+                }
+            }
+        } else if line.contains(" disconnected") {
+            in_connected_output = false;
+        } else if in_connected_output && !found_active_mode && line.contains('*') {
+            // This is the active mode line, e.g., "  1920x1080     60.00*+  59.97"
+            found_active_mode = true;
+            let trimmed = line.trim();
+
+            // Parse resolution from mode line if we didn't get it from the connected line
+            if current_width == 0 || current_height == 0 {
+                if let Some(res_str) = trimmed.split_whitespace().next() {
+                    if let Some((w, h)) = res_str.split_once('x') {
+                        current_width = w.parse().unwrap_or(0);
+                        current_height = h.parse().unwrap_or(0);
+                    }
+                }
+            }
+
+            // Find the refresh rate marked with '*'
+            let mut refresh_rate_hz: Option<f64> = None;
+            for token in trimmed.split_whitespace().skip(1) {
+                if token.contains('*') {
+                    let rate_str = token.replace('*', "").replace('+', "");
+                    if let Ok(hz) = rate_str.parse::<f64>() {
+                        refresh_rate_hz = Some(hz);
+                    }
+                    break;
+                }
+            }
+
+            // Calculate DPI from physical size
+            let dpi = if current_width_mm > 0.0 && current_width > 0 {
+                (current_width as f64) / (current_width_mm / 25.4)
+            } else {
+                96.0 // default DPI
+            };
+
+            if current_width > 0 && current_height > 0 {
+                displays.push(crate::models::DisplayInfo {
+                    name: current_name.clone(),
+                    width: current_width,
+                    height: current_height,
+                    dpi,
+                    refresh_rate_hz,
+                    is_primary: current_is_primary,
+                });
+            }
+
+            in_connected_output = false; // Done with this output
+        }
+    }
+
+    Ok(displays)
+}
+
 // ─── SystemInfoProvider Implementation ───
 
 impl SystemInfoProvider for LinuxSystemInfo {
@@ -477,11 +639,187 @@ impl SystemInfoProvider for LinuxSystemInfo {
         Ok(disks)
     }
 
-    // ─── Stubs for unimplemented features ───
+    // ─── GPU Info via sysfs + lspci ───
 
     #[cfg(feature = "gpu")]
     fn gpu_info(&self) -> Result<Vec<GpuInfo>, Box<dyn StdError>> {
-        Err("GPU info not yet implemented".into())
+        use std::process::Command;
+
+        let mut gpus = Vec::new();
+
+        // Try to enumerate GPU devices from /sys/class/drm/card*
+        let drm_entries: Vec<_> = std::fs::read_dir("/sys/class/drm")
+            .unwrap_or_else(|_| std::fs::read_dir("/dev/null").unwrap()) // fallback to empty iterator
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                let name = e.file_name().to_string_lossy().to_string();
+                // Match card0, card1, etc. but not card0-HDMI-1, etc.
+                name.starts_with("card") && name[4..].chars().all(|c| c.is_ascii_digit())
+            })
+            .collect();
+
+        for entry in &drm_entries {
+            let card_path = entry.path();
+            let device_path = card_path.join("device");
+
+            // Read PCI vendor ID
+            let vendor_id_str = std::fs::read_to_string(device_path.join("vendor"))
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            let vendor_id = u32::from_str_radix(
+                vendor_id_str.trim_start_matches("0x"),
+                16,
+            ).unwrap_or(0);
+
+            let vendor = match vendor_id {
+                0x10de => "NVIDIA".to_string(),
+                0x1002 => "AMD".to_string(),
+                0x8086 => "Intel".to_string(),
+                0x106b => "Apple".to_string(),
+                0x1a03 => "ASPEED".to_string(),
+                0 => "Unknown".to_string(),
+                other => format!("Unknown (0x{:04x})", other),
+            };
+
+            // Try to get GPU name from lspci
+            let name = {
+                // First try device label from sysfs
+                let label = std::fs::read_to_string(device_path.join("label"))
+                    .ok()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty());
+
+                if let Some(label) = label {
+                    label
+                } else {
+                    // Fall back to lspci to get a human-readable name
+                    let pci_slot = device_path.file_name()
+                        .and_then(|_| {
+                            // Read the uevent to get PCI_SLOT_NAME
+                            std::fs::read_to_string(device_path.join("uevent")).ok()
+                        })
+                        .and_then(|uevent| {
+                            for line in uevent.lines() {
+                                if let Some(slot) = line.strip_prefix("PCI_SLOT_NAME=") {
+                                    return Some(slot.to_string());
+                                }
+                            }
+                            None
+                        });
+
+                    if let Some(slot) = pci_slot {
+                        // Run lspci -s <slot> -mm to get device name
+                        Command::new("lspci")
+                            .args(["-s", &slot])
+                            .output()
+                            .ok()
+                            .and_then(|output| {
+                                if output.status.success() {
+                                    let line = String::from_utf8_lossy(&output.stdout).to_string();
+                                    // lspci output: "00:02.0 VGA compatible controller: Intel Corporation ..."
+                                    line.split_once(':')
+                                        .and_then(|(_, rest)| rest.split_once(':'))
+                                        .map(|(_, name)| name.trim().to_string())
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or_else(|| format!("{} GPU", vendor))
+                    } else {
+                        format!("{} GPU", vendor)
+                    }
+                }
+            };
+
+            // VRAM: try multiple sysfs paths
+            let vram_mb = {
+                // AMD: mem_info_vram_total (bytes)
+                let amd_vram = std::fs::read_to_string(device_path.join("mem_info_vram_total"))
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u64>().ok())
+                    .map(|bytes| bytes / (1024 * 1024));
+
+                if let Some(mb) = amd_vram {
+                    mb
+                } else {
+                    // Intel: try resource file or leave 0
+                    // NVIDIA: try /proc/driver/nvidia/gpus/*/information
+                    let card_name = entry.file_name().to_string_lossy().to_string();
+                    let card_num = card_name.trim_start_matches("card");
+                    nvidia_vram_from_proc(card_num).unwrap_or(0)
+                }
+            };
+
+            // Driver version
+            let driver_version = if vendor_id == 0x10de {
+                // NVIDIA: read from /sys/module/nvidia/version
+                std::fs::read_to_string("/sys/module/nvidia/version")
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string()
+            } else if vendor_id == 0x1002 {
+                // AMD: read from /sys/module/amdgpu/version or kernel version
+                std::fs::read_to_string("/sys/module/amdgpu/version")
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string()
+            } else {
+                // Intel and others: use kernel version as driver version
+                std::fs::read_to_string("/proc/version")
+                    .ok()
+                    .and_then(|s| {
+                        s.split_whitespace()
+                            .nth(2)
+                            .map(|v| v.to_string())
+                    })
+                    .unwrap_or_default()
+            };
+
+            gpus.push(GpuInfo {
+                name,
+                vendor,
+                vram_mb,
+                driver_version,
+            });
+        }
+
+        // If no GPUs found via sysfs, try lspci as fallback
+        if gpus.is_empty() {
+            if let Ok(output) = Command::new("lspci").output() {
+                if output.status.success() {
+                    let lspci_output = String::from_utf8_lossy(&output.stdout);
+                    for line in lspci_output.lines() {
+                        if line.contains("VGA") || line.contains("3D controller") || line.contains("Display controller") {
+                            // Parse: "00:02.0 VGA compatible controller: Intel Corporation Device Name"
+                            let name = line.split_once(':')
+                                .and_then(|(_, rest)| rest.split_once(':'))
+                                .map(|(_, name)| name.trim().to_string())
+                                .unwrap_or_else(|| line.to_string());
+
+                            let vendor = if name.contains("NVIDIA") || name.contains("GeForce") {
+                                "NVIDIA".to_string()
+                            } else if name.contains("AMD") || name.contains("Radeon") || name.contains("ATI") {
+                                "AMD".to_string()
+                            } else if name.contains("Intel") {
+                                "Intel".to_string()
+                            } else {
+                                "Unknown".to_string()
+                            };
+
+                            gpus.push(GpuInfo {
+                                name,
+                                vendor,
+                                vram_mb: 0,
+                                driver_version: String::new(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(gpus)
     }
 
     #[cfg(feature = "battery")]
@@ -603,6 +941,65 @@ impl SystemInfoProvider for LinuxSystemInfo {
 
     #[cfg(feature = "display")]
     fn display_info(&self) -> Result<Vec<DisplayInfo>, Box<dyn StdError>> {
-        Err("Display info not yet implemented".into())
+        // Try xrandr first (works on X11)
+        match parse_xrandr_displays() {
+            Ok(displays) if !displays.is_empty() => return Ok(displays),
+            _ => {}
+        }
+
+        // Fallback: read from /sys/class/drm for basic info
+        let mut displays = Vec::new();
+        if let Ok(entries) = std::fs::read_dir("/sys/class/drm") {
+            let mut is_first = true;
+            for entry in entries.filter_map(|e| e.ok()) {
+                let name = entry.file_name().to_string_lossy().to_string();
+                // Match connector entries like card0-HDMI-A-1, card0-eDP-1, etc.
+                if !name.contains('-') || !name.starts_with("card") {
+                    continue;
+                }
+
+                let connector_path = entry.path();
+
+                // Check if connected
+                let status = std::fs::read_to_string(connector_path.join("status"))
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
+                if status != "connected" {
+                    continue;
+                }
+
+                // Read modes (first line is preferred mode)
+                let modes_str = std::fs::read_to_string(connector_path.join("modes"))
+                    .unwrap_or_default();
+                let first_mode = modes_str.lines().next().unwrap_or("");
+
+                let (width, height) = if let Some((w, h)) = first_mode.split_once('x') {
+                    (w.parse::<u32>().unwrap_or(0), h.parse::<u32>().unwrap_or(0))
+                } else {
+                    continue;
+                };
+
+                if width == 0 || height == 0 {
+                    continue;
+                }
+
+                let connector_name = name.split_once('-')
+                    .map(|(_, rest)| rest.to_string())
+                    .unwrap_or(name.clone());
+
+                displays.push(DisplayInfo {
+                    name: connector_name,
+                    width,
+                    height,
+                    dpi: 96.0,
+                    refresh_rate_hz: None,
+                    is_primary: is_first,
+                });
+                is_first = false;
+            }
+        }
+
+        Ok(displays)
     }
 }

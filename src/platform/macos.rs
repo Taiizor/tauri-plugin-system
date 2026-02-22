@@ -364,6 +364,38 @@ mod memory_impl {
     }
 }
 
+// ─── Display Resolution Parser ───
+
+/// Parse resolution string like "3456 x 2234 @ 120 Hz" or "1920 x 1080"
+#[cfg(feature = "display")]
+fn parse_macos_resolution(s: &str) -> (u32, u32, Option<f64>) {
+    // Remove Retina markers and extra info in parentheses
+    let clean = s.split('(').next().unwrap_or(s).trim();
+
+    let mut width: u32 = 0;
+    let mut height: u32 = 0;
+    let mut refresh: Option<f64> = None;
+
+    // Split on " x " to get width and remainder
+    if let Some((w_str, remainder)) = clean.split_once(" x ") {
+        width = w_str.trim().parse().unwrap_or(0);
+
+        // Remainder might be "2234 @ 120 Hz" or just "2234"
+        if let Some((h_str, freq_part)) = remainder.split_once('@') {
+            height = h_str.trim().parse().unwrap_or(0);
+            // freq_part is like " 120 Hz"
+            let freq_str = freq_part.trim().trim_end_matches("Hz").trim();
+            if let Ok(hz) = freq_str.parse::<f64>() {
+                refresh = Some(hz);
+            }
+        } else {
+            height = remainder.trim().parse().unwrap_or(0);
+        }
+    }
+
+    (width, height, refresh)
+}
+
 // ─── SystemInfoProvider Implementation ───
 
 impl SystemInfoProvider for MacOSSystemInfo {
@@ -616,11 +648,111 @@ impl SystemInfoProvider for MacOSSystemInfo {
         Ok(disks)
     }
 
-    // ─── Stubs for unimplemented features ───
+    // ─── GPU Info via system_profiler ───
 
     #[cfg(feature = "gpu")]
     fn gpu_info(&self) -> Result<Vec<GpuInfo>, Box<dyn StdError>> {
-        Err("GPU info not yet implemented".into())
+        use std::process::Command;
+
+        let output = Command::new("system_profiler")
+            .args(["SPDisplaysDataType", "-json"])
+            .output()
+            .map_err(|e| format!("Failed to run system_profiler: {}", e))?;
+
+        if !output.status.success() {
+            return Err("system_profiler returned non-zero exit code".into());
+        }
+
+        let json_str = String::from_utf8_lossy(&output.stdout);
+        let parsed: serde_json::Value = serde_json::from_str(&json_str)
+            .map_err(|e| format!("Failed to parse system_profiler JSON: {}", e))?;
+
+        let mut gpus = Vec::new();
+
+        if let Some(displays_array) = parsed.get("SPDisplaysDataType").and_then(|v| v.as_array()) {
+            for gpu_entry in displays_array {
+                // GPU name
+                let name = gpu_entry.get("sppci_model")
+                    .or_else(|| gpu_entry.get("_name"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Unknown GPU")
+                    .to_string();
+
+                // Vendor
+                let vendor_raw = gpu_entry.get("sppci_vendor")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let vendor = if !vendor_raw.is_empty() {
+                    // system_profiler returns strings like "sppci_vendor_apple", "sppci_vendor_amd", etc.
+                    if vendor_raw.contains("apple") || name.contains("Apple") {
+                        "Apple".to_string()
+                    } else if vendor_raw.contains("amd") || vendor_raw.contains("ATI") || name.contains("AMD") || name.contains("Radeon") {
+                        "AMD".to_string()
+                    } else if vendor_raw.contains("nvidia") || name.contains("NVIDIA") || name.contains("GeForce") {
+                        "NVIDIA".to_string()
+                    } else if vendor_raw.contains("intel") || name.contains("Intel") {
+                        "Intel".to_string()
+                    } else {
+                        vendor_raw.to_string()
+                    }
+                } else {
+                    // Derive vendor from name
+                    if name.contains("Apple") {
+                        "Apple".to_string()
+                    } else if name.contains("AMD") || name.contains("Radeon") {
+                        "AMD".to_string()
+                    } else if name.contains("NVIDIA") || name.contains("GeForce") {
+                        "NVIDIA".to_string()
+                    } else if name.contains("Intel") {
+                        "Intel".to_string()
+                    } else {
+                        "Unknown".to_string()
+                    }
+                };
+
+                // VRAM in MB
+                let vram_mb = gpu_entry.get("sppci_vram")
+                    .or_else(|| gpu_entry.get("_spdisplays_vram"))
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| {
+                        // Format like "8 GB" or "1536 MB"
+                        let parts: Vec<&str> = s.split_whitespace().collect();
+                        if parts.len() >= 2 {
+                            let amount: u64 = parts[0].parse().ok()?;
+                            let unit = parts[1].to_uppercase();
+                            if unit.starts_with("GB") {
+                                Some(amount * 1024)
+                            } else if unit.starts_with("MB") {
+                                Some(amount)
+                            } else {
+                                Some(amount)
+                            }
+                        } else if let Ok(val) = s.parse::<u64>() {
+                            // If just a number, assume MB
+                            Some(val)
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or(0);
+
+                // Driver version: on Apple Silicon there's no meaningful driver version,
+                // use the Metal/GPU family support or leave empty
+                let driver_version = gpu_entry.get("spdisplays_metal")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_default();
+
+                gpus.push(GpuInfo {
+                    name,
+                    vendor,
+                    vram_mb,
+                    driver_version,
+                });
+            }
+        }
+
+        Ok(gpus)
     }
 
     #[cfg(feature = "battery")]
@@ -760,6 +892,78 @@ impl SystemInfoProvider for MacOSSystemInfo {
 
     #[cfg(feature = "display")]
     fn display_info(&self) -> Result<Vec<DisplayInfo>, Box<dyn StdError>> {
-        Err("Display info not yet implemented".into())
+        use std::process::Command;
+
+        // Use system_profiler to get display info in JSON format
+        let output = Command::new("system_profiler")
+            .args(["SPDisplaysDataType", "-json"])
+            .output()
+            .map_err(|e| format!("Failed to run system_profiler: {}", e))?;
+
+        if !output.status.success() {
+            return Err("system_profiler returned non-zero exit code".into());
+        }
+
+        let json_str = String::from_utf8_lossy(&output.stdout);
+        let parsed: serde_json::Value = serde_json::from_str(&json_str)
+            .map_err(|e| format!("Failed to parse system_profiler JSON: {}", e))?;
+
+        let mut displays = Vec::new();
+        let mut is_first_display = true;
+
+        if let Some(gpu_array) = parsed.get("SPDisplaysDataType").and_then(|v| v.as_array()) {
+            for gpu_entry in gpu_array {
+                // Each GPU entry may have a "spdisplays_ndrvs" array of connected displays
+                if let Some(display_array) = gpu_entry.get("spdisplays_ndrvs").and_then(|v| v.as_array()) {
+                    for display_entry in display_array {
+                        let name = display_entry.get("_name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("Unknown Display")
+                            .to_string();
+
+                        // Resolution: "_spdisplays_resolution" like "3456 x 2234 @ 120 Hz"
+                        // or "_spdisplays_pixels" like "3456 x 2234"
+                        let (width, height, refresh_rate_hz) = display_entry
+                            .get("_spdisplays_resolution")
+                            .and_then(|v| v.as_str())
+                            .map(|s| parse_macos_resolution(s))
+                            .unwrap_or((0, 0, None));
+
+                        // DPI: try to get from pixel resolution and physical size
+                        // system_profiler provides "_spdisplays_resolution" but not always physical size
+                        // Use Retina flag to estimate DPI
+                        let is_retina = display_entry.get("spdisplays_retina")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.contains("spdisplays_yes"))
+                            .unwrap_or(false);
+                        let dpi = if is_retina { 144.0 } else { 72.0 };
+
+                        // Primary: the main display is typically the first one listed
+                        let is_main = display_entry.get("spdisplays_main")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.contains("spdisplays_yes"))
+                            .unwrap_or(false);
+                        let is_primary = is_main || (is_first_display && displays.is_empty());
+
+                        if is_first_display {
+                            is_first_display = false;
+                        }
+
+                        if width > 0 && height > 0 {
+                            displays.push(DisplayInfo {
+                                name,
+                                width,
+                                height,
+                                dpi,
+                                refresh_rate_hz,
+                                is_primary,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(displays)
     }
 }
