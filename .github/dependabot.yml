@@ -33,6 +33,12 @@ updates:
     ignore:
       - dependency-name: "tauri"
         update-types: ["version-update:semver-major"]
+      - dependency-name: "windows"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "mach2"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "core-foundation"
+        update-types: ["version-update:semver-major"]
 
   # NPM dependencies
   - package-ecosystem: "npm"

@@ -265,7 +265,6 @@ fn parse_xrandr_displays() -> Result<Vec<crate::models::DisplayInfo>, Box<dyn st
     let mut current_name = String::new();
     let mut current_is_primary = false;
     let mut current_width_mm: f64 = 0.0;
-    let mut current_height_mm: f64 = 0.0;
     let mut current_width: u32 = 0;
     let mut current_height: u32 = 0;
     let mut found_active_mode = false;
@@ -287,12 +286,10 @@ fn parse_xrandr_displays() -> Result<Vec<crate::models::DisplayInfo>, Box<dyn st
 
             // Extract physical size in mm (e.g., "344mm x 193mm")
             current_width_mm = 0.0;
-            current_height_mm = 0.0;
             let parts: Vec<&str> = line.split_whitespace().collect();
             for (i, part) in parts.iter().enumerate() {
                 if part.ends_with("mm") && i + 2 < parts.len() && parts[i + 1] == "x" && parts[i + 2].ends_with("mm") {
                     current_width_mm = part.trim_end_matches("mm").parse().unwrap_or(0.0);
-                    current_height_mm = parts[i + 2].trim_end_matches("mm").parse().unwrap_or(0.0);
                     break;
                 }
             }

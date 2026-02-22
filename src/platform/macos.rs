@@ -299,6 +299,7 @@ mod memory_impl {
         pub xsu_encrypted: bool,
     }
 
+    #[allow(dead_code)]
     pub struct MemoryStats {
         pub free_count: u64,
         pub active_count: u64,
