@@ -533,12 +533,90 @@ impl SystemInfoProvider for MacOSSystemInfo {
         })
     }
 
-    // ─── Stubs for unimplemented features ───
+    // ─── Disk Info ───
 
     #[cfg(feature = "disk")]
     fn disk_info(&self) -> Result<Vec<DiskInfo>, Box<dyn StdError>> {
-        Err("Disk info not yet implemented".into())
+        let mut disks = Vec::new();
+
+        unsafe {
+            // Get the number of mounted filesystems
+            let mut mntbuf: *mut libc::statfs = std::ptr::null_mut();
+            let count = libc::getmntinfo(&mut mntbuf, libc::MNT_NOWAIT);
+            if count <= 0 || mntbuf.is_null() {
+                return Ok(disks);
+            }
+
+            let entries = std::slice::from_raw_parts(mntbuf, count as usize);
+
+            // Pseudo-filesystem types to skip
+            let pseudo_fs = [
+                "devfs", "autofs", "nullfs", "vmhgfs", "ctfs", "fdescfs",
+                "nfs", "devpts", "tmpfs",
+            ];
+
+            for entry in entries {
+                let fs_type = std::ffi::CStr::from_ptr(entry.f_fstypename.as_ptr())
+                    .to_string_lossy()
+                    .to_string();
+
+                // Skip pseudo-filesystems
+                if pseudo_fs.contains(&fs_type.as_str()) {
+                    continue;
+                }
+
+                let device_name = std::ffi::CStr::from_ptr(entry.f_mntfromname.as_ptr())
+                    .to_string_lossy()
+                    .to_string();
+
+                let mount_point = std::ffi::CStr::from_ptr(entry.f_mntonname.as_ptr())
+                    .to_string_lossy()
+                    .to_string();
+
+                // Skip entries that don't start with /dev/
+                if !device_name.starts_with("/dev/") {
+                    continue;
+                }
+
+                let block_size = entry.f_bsize as u64;
+                let total_bytes = entry.f_blocks as u64 * block_size;
+                let free_bytes = entry.f_bfree as u64 * block_size;
+                let used_bytes = total_bytes.saturating_sub(free_bytes);
+
+                // Use volume name from device path or mount point
+                let name = if mount_point == "/" {
+                    "Macintosh HD".to_string()
+                } else {
+                    mount_point
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or(&mount_point)
+                        .to_string()
+                };
+
+                // Determine if removable based on filesystem type
+                let is_removable = matches!(fs_type.as_str(), "msdos" | "exfat" | "udf");
+
+                // SSD detection is complex on macOS (requires IOKit); default to Unknown
+                let kind = DiskKind::Unknown;
+
+                disks.push(DiskInfo {
+                    name,
+                    mount_point,
+                    fs_type,
+                    kind,
+                    total_bytes,
+                    used_bytes,
+                    free_bytes,
+                    is_removable,
+                });
+            }
+        }
+
+        Ok(disks)
     }
+
+    // ─── Stubs for unimplemented features ───
 
     #[cfg(feature = "gpu")]
     fn gpu_info(&self) -> Result<Vec<GpuInfo>, Box<dyn StdError>> {
@@ -550,9 +628,129 @@ impl SystemInfoProvider for MacOSSystemInfo {
         Err("Battery info not yet implemented".into())
     }
 
+    // ─── Network Info ───
+
     #[cfg(feature = "network")]
     fn network_info(&self) -> Result<Vec<NetworkInfo>, Box<dyn StdError>> {
-        Err("Network info not yet implemented".into())
+        use std::collections::HashMap;
+
+        let mut iface_map: HashMap<String, NetworkInfo> = HashMap::new();
+
+        unsafe {
+            let mut ifaddrs: *mut libc::ifaddrs = std::ptr::null_mut();
+            if libc::getifaddrs(&mut ifaddrs) != 0 {
+                return Err("getifaddrs failed".into());
+            }
+
+            let mut current = ifaddrs;
+            while !current.is_null() {
+                let ifa = &*current;
+                let name = std::ffi::CStr::from_ptr(ifa.ifa_name)
+                    .to_string_lossy()
+                    .to_string();
+
+                let entry = iface_map.entry(name.clone()).or_insert_with(|| NetworkInfo {
+                    name: name.clone(),
+                    mac_address: String::new(),
+                    ipv4: Vec::new(),
+                    ipv6: Vec::new(),
+                    rx_bytes: 0,
+                    tx_bytes: 0,
+                    is_up: (ifa.ifa_flags as u32 & libc::IFF_UP as u32) != 0,
+                });
+
+                if !ifa.ifa_addr.is_null() {
+                    let sa_family = (*ifa.ifa_addr).sa_family;
+
+                    if sa_family == libc::AF_INET as u8 {
+                        // IPv4
+                        let sin = &*(ifa.ifa_addr as *const libc::sockaddr_in);
+                        let addr_bytes = sin.sin_addr.s_addr.to_ne_bytes();
+                        entry.ipv4.push(format!(
+                            "{}.{}.{}.{}",
+                            addr_bytes[0], addr_bytes[1], addr_bytes[2], addr_bytes[3]
+                        ));
+                    } else if sa_family == libc::AF_INET6 as u8 {
+                        // IPv6
+                        let sin6 = &*(ifa.ifa_addr as *const libc::sockaddr_in6);
+                        let addr = sin6.sin6_addr.s6_addr;
+                        let segments: Vec<String> = (0..8)
+                            .map(|i| {
+                                let hi = addr[i * 2] as u16;
+                                let lo = addr[i * 2 + 1] as u16;
+                                format!("{:x}", (hi << 8) | lo)
+                            })
+                            .collect();
+                        entry.ipv6.push(segments.join(":"));
+                    } else if sa_family == libc::AF_LINK as u8 {
+                        // AF_LINK: MAC address and traffic counters
+                        // sockaddr_dl layout on macOS
+                        #[repr(C)]
+                        struct SockaddrDl {
+                            sdl_len: u8,
+                            sdl_family: u8,
+                            sdl_index: u16,
+                            sdl_type: u8,
+                            sdl_nlen: u8,
+                            sdl_alen: u8,
+                            sdl_slen: u8,
+                            sdl_data: [u8; 12],
+                        }
+
+                        let sdl = &*(ifa.ifa_addr as *const SockaddrDl);
+                        if sdl.sdl_alen == 6 {
+                            let mac_start = sdl.sdl_nlen as usize;
+                            let mac_bytes = &sdl.sdl_data[mac_start..mac_start + 6];
+                            entry.mac_address = mac_bytes
+                                .iter()
+                                .map(|b| format!("{:02x}", b))
+                                .collect::<Vec<_>>()
+                                .join(":");
+                        }
+
+                        // Get rx/tx bytes from ifa_data (struct if_data)
+                        if !ifa.ifa_data.is_null() {
+                            // struct if_data on macOS has ifi_ibytes and ifi_obytes
+                            // The layout: we only care about ifi_ibytes at offset ~112
+                            // and ifi_obytes at offset ~120 (for 64-bit macOS).
+                            // Simpler approach: define the struct partially.
+                            #[repr(C)]
+                            struct IfData {
+                                ifi_type: u8,
+                                ifi_typelen: u8,
+                                ifi_physical: u8,
+                                ifi_addrlen: u8,
+                                ifi_hdrlen: u8,
+                                ifi_recvquota: u8,
+                                ifi_xmitquota: u8,
+                                ifi_unused1: u8,
+                                ifi_mtu: u32,
+                                ifi_metric: u32,
+                                ifi_baudrate: u32,
+                                ifi_ipackets: u32,
+                                ifi_ierrors: u32,
+                                ifi_opackets: u32,
+                                ifi_oerrors: u32,
+                                ifi_collisions: u32,
+                                ifi_ibytes: u32,
+                                ifi_obytes: u32,
+                                // ... more fields follow
+                            }
+
+                            let if_data = &*(ifa.ifa_data as *const IfData);
+                            entry.rx_bytes = if_data.ifi_ibytes as u64;
+                            entry.tx_bytes = if_data.ifi_obytes as u64;
+                        }
+                    }
+                }
+
+                current = ifa.ifa_next;
+            }
+
+            libc::freeifaddrs(ifaddrs);
+        }
+
+        Ok(iface_map.into_values().collect())
     }
 
     #[cfg(feature = "thermal")]

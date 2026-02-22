@@ -38,6 +38,25 @@ use windows::core::PCWSTR;
 #[cfg(feature = "memory")]
 use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
 
+#[cfg(feature = "disk")]
+use windows::Win32::Storage::FileSystem::{
+    GetDiskFreeSpaceExW, GetDriveTypeW, GetLogicalDriveStringsW, GetVolumeInformationW,
+};
+
+#[cfg(feature = "network")]
+use windows::Win32::NetworkManagement::IpHelper::{
+    GetAdaptersAddresses, GetIfEntry2, GAA_FLAG_INCLUDE_PREFIX,
+    MIB_IF_ROW2,
+};
+
+#[cfg(feature = "network")]
+use windows::Win32::NetworkManagement::Ndis::IfOperStatusUp;
+
+#[cfg(feature = "network")]
+use windows::Win32::Networking::WinSock::{
+    AF_INET, AF_INET6, AF_UNSPEC, SOCKADDR_IN, SOCKADDR_IN6,
+};
+
 pub struct WindowsSystemInfo;
 
 impl WindowsSystemInfo {
@@ -209,6 +228,100 @@ fn get_physical_core_count() -> Result<u32, Box<dyn StdError>> {
         }
 
         Ok(core_count)
+    }
+}
+
+// ─── SSD/HDD Detection via DeviceIoControl ───
+
+#[cfg(feature = "disk")]
+fn detect_disk_kind_for_drive(drive_path: &str) -> DiskKind {
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+    use windows::Win32::System::IO::DeviceIoControl;
+    use windows::Win32::Foundation::CloseHandle;
+
+    // Extract the drive letter from a path like "C:\"
+    let drive_letter = match drive_path.chars().next() {
+        Some(c) if c.is_ascii_alphabetic() => c,
+        _ => return DiskKind::Unknown,
+    };
+
+    // Open the physical drive via the volume device path
+    let device_path = format!("\\\\.\\{}:", drive_letter);
+    let device_wide: Vec<u16> = device_path.encode_utf16().chain(std::iter::once(0)).collect();
+
+    unsafe {
+        let handle = CreateFileW(
+            windows::core::PCWSTR(device_wide.as_ptr()),
+            0, // No access needed for IOCTL query
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            None,
+            OPEN_EXISTING,
+            windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES(0),
+            None,
+        );
+
+        let handle = match handle {
+            Ok(h) => h,
+            Err(_) => return DiskKind::Unknown,
+        };
+
+        // IOCTL_STORAGE_QUERY_PROPERTY = CTL_CODE(IOCTL_STORAGE_BASE, 0x0500, METHOD_BUFFERED, FILE_ANY_ACCESS)
+        // = 0x002D1400
+        const IOCTL_STORAGE_QUERY_PROPERTY: u32 = 0x002D1400;
+
+        // StorageDeviceSeekPenaltyProperty = 7
+        // PropertyStandardQuery = 0
+        #[repr(C)]
+        struct StoragePropertyQuery {
+            property_id: u32,
+            query_type: u32,
+            additional_parameters: [u8; 1],
+        }
+
+        #[repr(C)]
+        struct DeviceSeekPenaltyDescriptor {
+            version: u32,
+            size: u32,
+            incurs_seek_penalty: u8, // BOOLEAN
+        }
+
+        let query = StoragePropertyQuery {
+            property_id: 7, // StorageDeviceSeekPenaltyProperty
+            query_type: 0,  // PropertyStandardQuery
+            additional_parameters: [0],
+        };
+
+        let mut result = DeviceSeekPenaltyDescriptor {
+            version: 0,
+            size: 0,
+            incurs_seek_penalty: 1,
+        };
+        let mut bytes_returned: u32 = 0;
+
+        let ok: Result<(), _> = DeviceIoControl(
+            handle,
+            IOCTL_STORAGE_QUERY_PROPERTY,
+            Some(&query as *const _ as *const std::ffi::c_void),
+            std::mem::size_of::<StoragePropertyQuery>() as u32,
+            Some(&mut result as *mut _ as *mut std::ffi::c_void),
+            std::mem::size_of::<DeviceSeekPenaltyDescriptor>() as u32,
+            Some(&mut bytes_returned),
+            None,
+        );
+
+        let _: Result<(), _> = CloseHandle(handle);
+
+        if ok.is_ok() && bytes_returned > 0 {
+            if result.incurs_seek_penalty == 0 {
+                DiskKind::Ssd
+            } else {
+                DiskKind::Hdd
+            }
+        } else {
+            DiskKind::Unknown
+        }
     }
 }
 
@@ -449,12 +562,125 @@ impl SystemInfoProvider for WindowsSystemInfo {
         }
     }
 
-    // ─── Stubs for unimplemented features ───
+    // ─── Disk Info ───
 
     #[cfg(feature = "disk")]
     fn disk_info(&self) -> Result<Vec<DiskInfo>, Box<dyn StdError>> {
-        Err("Disk info not yet implemented".into())
+        // Windows drive type constants
+        const DRIVE_REMOVABLE_CONST: u32 = 2;
+        const DRIVE_CDROM_CONST: u32 = 5;
+
+        let mut disks = Vec::new();
+
+        unsafe {
+            // Get all logical drive strings (e.g., "C:\\\0D:\\\0\0")
+            let mut buffer = vec![0u16; 512];
+            let len = GetLogicalDriveStringsW(Some(&mut buffer));
+            if len == 0 {
+                return Ok(disks);
+            }
+
+            // Parse the double-null-terminated string list
+            let drive_strings = &buffer[..len as usize];
+            let mut start = 0;
+            for (i, &ch) in drive_strings.iter().enumerate() {
+                if ch == 0 {
+                    if i > start {
+                        let drive_wide = &drive_strings[start..=i]; // include null terminator
+                        let drive_str = String::from_utf16_lossy(&drive_strings[start..i]);
+                        let drive_pcwstr = windows::core::PCWSTR(drive_wide.as_ptr());
+
+                        // Get drive type
+                        let drive_type = GetDriveTypeW(drive_pcwstr);
+                        let is_removable = drive_type == DRIVE_REMOVABLE_CONST || drive_type == DRIVE_CDROM_CONST;
+
+                        // Skip DRIVE_UNKNOWN (0) or DRIVE_NO_ROOT_DIR (1)
+                        if drive_type <= 1 {
+                            start = i + 1;
+                            continue;
+                        }
+
+                        // Get volume information (name, filesystem type)
+                        let mut vol_name_buf = vec![0u16; 256];
+                        let mut fs_name_buf = vec![0u16; 256];
+                        let mut serial_number: u32 = 0;
+                        let mut max_component_length: u32 = 0;
+                        let mut fs_flags: u32 = 0;
+
+                        let vol_ok = GetVolumeInformationW(
+                            drive_pcwstr,
+                            Some(&mut vol_name_buf),
+                            Some(&mut serial_number),
+                            Some(&mut max_component_length),
+                            Some(&mut fs_flags),
+                            Some(&mut fs_name_buf),
+                        );
+
+                        let vol_name = if vol_ok.is_ok() {
+                            let len = vol_name_buf.iter().position(|&c| c == 0).unwrap_or(vol_name_buf.len());
+                            String::from_utf16_lossy(&vol_name_buf[..len])
+                        } else {
+                            String::new()
+                        };
+
+                        let fs_type = if vol_ok.is_ok() {
+                            let len = fs_name_buf.iter().position(|&c| c == 0).unwrap_or(fs_name_buf.len());
+                            String::from_utf16_lossy(&fs_name_buf[..len])
+                        } else {
+                            String::new()
+                        };
+
+                        // Get disk free space
+                        let mut free_bytes_available: u64 = 0;
+                        let mut total_bytes: u64 = 0;
+                        let mut total_free_bytes: u64 = 0;
+
+                        let space_ok = GetDiskFreeSpaceExW(
+                            drive_pcwstr,
+                            Some(&mut free_bytes_available),
+                            Some(&mut total_bytes),
+                            Some(&mut total_free_bytes),
+                        );
+
+                        if space_ok.is_err() {
+                            // Drive might not be ready (e.g. empty CD drive)
+                            start = i + 1;
+                            continue;
+                        }
+
+                        let used_bytes = total_bytes.saturating_sub(total_free_bytes);
+
+                        // SSD detection: try to query seek penalty property via DeviceIoControl
+                        let kind = detect_disk_kind_for_drive(&drive_str);
+
+                        let name = if vol_name.is_empty() {
+                            drive_str.trim_end_matches('\\').to_string()
+                        } else {
+                            vol_name
+                        };
+
+                        let mount_point = drive_str.trim_end_matches('\\').to_string();
+
+                        disks.push(DiskInfo {
+                            name,
+                            mount_point,
+                            fs_type,
+                            kind,
+                            total_bytes,
+                            used_bytes,
+                            free_bytes: total_free_bytes,
+                            is_removable,
+                        });
+                    }
+                    start = i + 1;
+                }
+            }
+        }
+
+        Ok(disks)
     }
+
+    // ─── Stubs for unimplemented features ───
 
     #[cfg(feature = "gpu")]
     fn gpu_info(&self) -> Result<Vec<GpuInfo>, Box<dyn StdError>> {
@@ -466,9 +692,128 @@ impl SystemInfoProvider for WindowsSystemInfo {
         Err("Battery info not yet implemented".into())
     }
 
+    // ─── Network Info ───
+
     #[cfg(feature = "network")]
     fn network_info(&self) -> Result<Vec<NetworkInfo>, Box<dyn StdError>> {
-        Err("Network info not yet implemented".into())
+        let mut interfaces = Vec::new();
+
+        unsafe {
+            // First call to determine buffer size
+            let mut buf_len: u32 = 0;
+            let family = AF_UNSPEC.0 as u32;
+            let flags = GAA_FLAG_INCLUDE_PREFIX;
+
+            let ret = GetAdaptersAddresses(family, flags, None, None, &mut buf_len);
+            if ret != 111 {
+                // ERROR_BUFFER_OVERFLOW = 111
+                return Err(format!("GetAdaptersAddresses sizing failed: {}", ret).into());
+            }
+
+            let mut buffer: Vec<u8> = vec![0u8; buf_len as usize];
+            let adapter_ptr = buffer.as_mut_ptr() as *mut windows::Win32::NetworkManagement::IpHelper::IP_ADAPTER_ADDRESSES_LH;
+
+            let ret = GetAdaptersAddresses(
+                family,
+                flags,
+                None,
+                Some(adapter_ptr),
+                &mut buf_len,
+            );
+
+            if ret != 0 {
+                return Err(format!("GetAdaptersAddresses failed: {}", ret).into());
+            }
+
+            let mut current = adapter_ptr;
+            while !current.is_null() {
+                let adapter = &*current;
+
+                // Get friendly name
+                let name = if !adapter.FriendlyName.0.is_null() {
+                    let mut len = 0;
+                    let mut p = adapter.FriendlyName.0;
+                    while *p != 0 {
+                        len += 1;
+                        p = p.add(1);
+                    }
+                    String::from_utf16_lossy(std::slice::from_raw_parts(adapter.FriendlyName.0, len))
+                } else {
+                    String::new()
+                };
+
+                // Get MAC address
+                let phys_len = adapter.PhysicalAddressLength as usize;
+                let mac_address = if phys_len > 0 {
+                    adapter.PhysicalAddress[..phys_len]
+                        .iter()
+                        .map(|b| format!("{:02X}", b))
+                        .collect::<Vec<_>>()
+                        .join(":")
+                } else {
+                    String::new()
+                };
+
+                // Walk unicast address list for IPv4/IPv6
+                let mut ipv4 = Vec::new();
+                let mut ipv6 = Vec::new();
+                let mut unicast = adapter.FirstUnicastAddress;
+                while !unicast.is_null() {
+                    let ua = &*unicast;
+                    let sa = ua.Address.lpSockaddr;
+                    if !sa.is_null() {
+                        let sa_family = (*sa).sa_family;
+                        if sa_family == AF_INET {
+                            let sin = &*(sa as *const SOCKADDR_IN);
+                            let addr = sin.sin_addr.S_un.S_addr.to_ne_bytes();
+                            ipv4.push(format!("{}.{}.{}.{}", addr[0], addr[1], addr[2], addr[3]));
+                        } else if sa_family == AF_INET6 {
+                            let sin6 = &*(sa as *const SOCKADDR_IN6);
+                            let addr = sin6.sin6_addr.u.Byte;
+                            let segments: Vec<String> = (0..8)
+                                .map(|i| {
+                                    let hi = addr[i * 2] as u16;
+                                    let lo = addr[i * 2 + 1] as u16;
+                                    format!("{:x}", (hi << 8) | lo)
+                                })
+                                .collect();
+                            ipv6.push(segments.join(":"));
+                        }
+                    }
+                    unicast = (*unicast).Next;
+                }
+
+                // Check operational status
+                let is_up = adapter.OperStatus == IfOperStatusUp;
+
+                // Get rx/tx bytes using GetIfEntry2
+                let mut rx_bytes: u64 = 0;
+                let mut tx_bytes: u64 = 0;
+                let if_index = adapter.Anonymous1.Anonymous.IfIndex;
+                if if_index != 0 {
+                    let mut row = MIB_IF_ROW2::default();
+                    row.InterfaceIndex = if_index;
+                    if GetIfEntry2(&mut row).is_ok() {
+                        rx_bytes = row.InOctets;
+                        tx_bytes = row.OutOctets;
+                    }
+                }
+
+                interfaces.push(NetworkInfo {
+                    name,
+                    mac_address,
+                    ipv4,
+                    ipv6,
+                    rx_bytes,
+                    tx_bytes,
+                    is_up,
+                });
+
+                current = adapter.Next;
+            }
+        }
+
+        Ok(interfaces)
     }
 
     #[cfg(feature = "thermal")]

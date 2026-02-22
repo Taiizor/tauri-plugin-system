@@ -359,12 +359,125 @@ impl SystemInfoProvider for LinuxSystemInfo {
         })
     }
 
-    // ─── Stubs for unimplemented features ───
+    // ─── Disk Info ───
 
     #[cfg(feature = "disk")]
     fn disk_info(&self) -> Result<Vec<DiskInfo>, Box<dyn StdError>> {
-        Err("Disk info not yet implemented".into())
+        let mounts = std::fs::read_to_string("/proc/mounts")
+            .map_err(|e| format!("Failed to read /proc/mounts: {}", e))?;
+
+        // Pseudo-filesystem types to skip
+        let pseudo_fs = [
+            "proc", "sysfs", "devtmpfs", "tmpfs", "cgroup", "cgroup2",
+            "pstore", "debugfs", "securityfs", "configfs", "fusectl",
+            "mqueue", "hugetlbfs", "devpts", "autofs", "binfmt_misc",
+            "tracefs", "efivarfs", "bpf", "overlay", "nsfs", "ramfs",
+            "rpc_pipefs", "nfsd", "fuse.portal", "fuse.gvfsd-fuse",
+        ];
+
+        let mut disks = Vec::new();
+
+        for line in mounts.lines() {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() < 4 {
+                continue;
+            }
+
+            let device = parts[0];
+            let mount_point = parts[1];
+            let fs_type = parts[2];
+
+            // Skip pseudo-filesystems
+            if pseudo_fs.contains(&fs_type) {
+                continue;
+            }
+
+            // Only include real block devices that start with /dev/
+            if !device.starts_with("/dev/") {
+                continue;
+            }
+
+            // Get disk space using statvfs
+            let mount_c = std::ffi::CString::new(mount_point)?;
+            let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+            let ret = unsafe { libc::statvfs(mount_c.as_ptr(), &mut stat) };
+            if ret != 0 {
+                continue;
+            }
+
+            let block_size = stat.f_frsize as u64;
+            let total_bytes = stat.f_blocks as u64 * block_size;
+            let free_bytes = stat.f_bfree as u64 * block_size;
+            let used_bytes = total_bytes.saturating_sub(free_bytes);
+
+            // Skip entries with 0 total bytes (virtual entries)
+            if total_bytes == 0 {
+                continue;
+            }
+
+            // Extract base device name for sysfs lookups (e.g., /dev/sda1 -> sda)
+            let dev_name = device
+                .rsplit('/')
+                .next()
+                .unwrap_or(device);
+            // Strip partition number to get base device (sda1 -> sda, nvme0n1p1 -> nvme0n1)
+            let base_device = if dev_name.starts_with("nvme") || dev_name.starts_with("mmcblk") {
+                // NVMe: nvme0n1p1 -> nvme0n1, MMC: mmcblk0p1 -> mmcblk0
+                if let Some(pos) = dev_name.rfind('p') {
+                    if dev_name[pos + 1..].chars().all(|c| c.is_ascii_digit()) {
+                        &dev_name[..pos]
+                    } else {
+                        dev_name
+                    }
+                } else {
+                    dev_name
+                }
+            } else {
+                // SCSI/SATA: sda1 -> sda, vda1 -> vda
+                dev_name.trim_end_matches(|c: char| c.is_ascii_digit())
+            };
+
+            // Detect SSD vs HDD
+            let kind = {
+                let rotational_path = format!("/sys/block/{}/queue/rotational", base_device);
+                match std::fs::read_to_string(&rotational_path) {
+                    Ok(val) => match val.trim() {
+                        "0" => DiskKind::Ssd,
+                        "1" => DiskKind::Hdd,
+                        _ => DiskKind::Unknown,
+                    },
+                    Err(_) => DiskKind::Unknown,
+                }
+            };
+
+            // Check if removable
+            let is_removable = {
+                let removable_path = format!("/sys/block/{}/removable", base_device);
+                match std::fs::read_to_string(&removable_path) {
+                    Ok(val) => val.trim() == "1",
+                    Err(_) => false,
+                }
+            };
+
+            // Use device basename as name
+            let name = dev_name.to_string();
+
+            disks.push(DiskInfo {
+                name,
+                mount_point: mount_point.to_string(),
+                fs_type: fs_type.to_string(),
+                kind,
+                total_bytes,
+                used_bytes,
+                free_bytes,
+                is_removable,
+            });
+        }
+
+        Ok(disks)
     }
+
+    // ─── Stubs for unimplemented features ───
 
     #[cfg(feature = "gpu")]
     fn gpu_info(&self) -> Result<Vec<GpuInfo>, Box<dyn StdError>> {
@@ -376,9 +489,111 @@ impl SystemInfoProvider for LinuxSystemInfo {
         Err("Battery info not yet implemented".into())
     }
 
+    // ─── Network Info ───
+
     #[cfg(feature = "network")]
     fn network_info(&self) -> Result<Vec<NetworkInfo>, Box<dyn StdError>> {
-        Err("Network info not yet implemented".into())
+        use std::collections::HashMap;
+
+        let mut iface_map: HashMap<String, NetworkInfo> = HashMap::new();
+
+        // Parse /proc/net/dev for rx/tx byte counters
+        if let Ok(content) = std::fs::read_to_string("/proc/net/dev") {
+            for line in content.lines().skip(2) {
+                // Lines look like: "  eth0: 1234 ... 5678 ..."
+                let line = line.trim();
+                if let Some((name, rest)) = line.split_once(':') {
+                    let name = name.trim().to_string();
+                    let values: Vec<u64> = rest
+                        .split_whitespace()
+                        .filter_map(|v| v.parse().ok())
+                        .collect();
+
+                    // Fields: rx_bytes rx_packets ... tx_bytes tx_packets ...
+                    let rx_bytes = values.first().copied().unwrap_or(0);
+                    let tx_bytes = values.get(8).copied().unwrap_or(0);
+
+                    iface_map.insert(name.clone(), NetworkInfo {
+                        name,
+                        mac_address: String::new(),
+                        ipv4: Vec::new(),
+                        ipv6: Vec::new(),
+                        rx_bytes,
+                        tx_bytes,
+                        is_up: false,
+                    });
+                }
+            }
+        }
+
+        // Read MAC addresses from /sys/class/net/<iface>/address
+        for entry in iface_map.values_mut() {
+            let mac_path = format!("/sys/class/net/{}/address", entry.name);
+            if let Ok(mac) = std::fs::read_to_string(&mac_path) {
+                entry.mac_address = mac.trim().to_string();
+            }
+
+            // Read operational state from /sys/class/net/<iface>/operstate
+            let state_path = format!("/sys/class/net/{}/operstate", entry.name);
+            if let Ok(state) = std::fs::read_to_string(&state_path) {
+                entry.is_up = state.trim() == "up";
+            }
+        }
+
+        // Get IP addresses using getifaddrs
+        unsafe {
+            let mut ifaddrs: *mut libc::ifaddrs = std::ptr::null_mut();
+            if libc::getifaddrs(&mut ifaddrs) == 0 {
+                let mut current = ifaddrs;
+                while !current.is_null() {
+                    let ifa = &*current;
+                    let name = std::ffi::CStr::from_ptr(ifa.ifa_name)
+                        .to_string_lossy()
+                        .to_string();
+
+                    if !ifa.ifa_addr.is_null() {
+                        let sa_family = (*ifa.ifa_addr).sa_family;
+
+                        // Ensure we have an entry for this interface
+                        let entry = iface_map.entry(name.clone()).or_insert_with(|| NetworkInfo {
+                            name: name.clone(),
+                            mac_address: String::new(),
+                            ipv4: Vec::new(),
+                            ipv6: Vec::new(),
+                            rx_bytes: 0,
+                            tx_bytes: 0,
+                            is_up: (ifa.ifa_flags as u32 & libc::IFF_UP as u32) != 0,
+                        });
+
+                        if sa_family == libc::AF_INET as u16 {
+                            let sin = &*(ifa.ifa_addr as *const libc::sockaddr_in);
+                            let addr_bytes = sin.sin_addr.s_addr.to_ne_bytes();
+                            entry.ipv4.push(format!(
+                                "{}.{}.{}.{}",
+                                addr_bytes[0], addr_bytes[1], addr_bytes[2], addr_bytes[3]
+                            ));
+                        } else if sa_family == libc::AF_INET6 as u16 {
+                            let sin6 = &*(ifa.ifa_addr as *const libc::sockaddr_in6);
+                            let addr = sin6.sin6_addr.s6_addr;
+                            let segments: Vec<String> = (0..8)
+                                .map(|i| {
+                                    let hi = addr[i * 2] as u16;
+                                    let lo = addr[i * 2 + 1] as u16;
+                                    format!("{:x}", (hi << 8) | lo)
+                                })
+                                .collect();
+                            entry.ipv6.push(segments.join(":"));
+                        }
+                    }
+
+                    current = ifa.ifa_next;
+                }
+
+                libc::freeifaddrs(ifaddrs);
+            }
+        }
+
+        Ok(iface_map.into_values().collect())
     }
 
     #[cfg(feature = "thermal")]
